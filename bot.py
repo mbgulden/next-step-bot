@@ -145,10 +145,10 @@ def _load_soul() -> str:
         try:
             with open(SOUL_PATH) as f:
                 SOUL_PROMPT = f.read()
-            # Replace "Fred" with "Jamie" if still present
-            SOUL_PROMPT = SOUL_PROMPT.replace("Fred", "Jamie")
+            # Replace "Fred" with the configured assistant name
+            SOUL_PROMPT = SOUL_PROMPT.replace("Fred", ASSISTANT_NAME)
         except Exception:
-            SOUL_PROMPT = "You are Jamie, Michael's executive function and Human Design assistant."
+            SOUL_PROMPT = f"You are {ASSISTANT_NAME}, an executive function and Human Design assistant."
     return SOUL_PROMPT
 
 
@@ -573,6 +573,18 @@ async def _handle_message_impl(update: Update, context: ContextTypes.DEFAULT_TYP
     state_context += f"\nFamily profiles available: {', '.join(_family_data.keys())}"
     state_context += f"\nToday is {datetime.now(timezone.utc).strftime('%A, %B %d %Y, %H:%M UTC')}"
     
+    # ── Silent HD pre-fetch ──
+    # If no recent conversation history, inject HD data silently
+    # so Jamie wakes up already knowing the chart — no visible tool call
+    hd_context = _fetch_silent_hd_context(conn, user_id)
+    if hd_context:
+        state_context += "\n\n" + hd_context
+    
+    # ── Journal context ──
+    journal_context = _get_recent_journal_context(user_id)
+    if journal_context:
+        state_context += "\n\n" + journal_context
+    
     messages = [
         {"role": "system", "content": soul + state_context}
     ]
@@ -625,6 +637,15 @@ async def _handle_message_impl(update: Update, context: ContextTypes.DEFAULT_TYP
                 conn.commit()
                 logger.info(f"[{display_name}] Auto-parsed {len(tasks_found)} tasks from dump")
     
+    # ── Extract journal entries from Jamie's response ──
+    import re as _re
+    journal_match = _re.search(r'\[JOURNAL:\s*(.+?)\]', response, _re.DOTALL)
+    if journal_match:
+        journal_text = journal_match.group(1).strip()
+        response = response[:journal_match.start()] + response[journal_match.end():]
+        response = response.strip()
+        _append_journal_entry(user_id, journal_text)
+    
     # ── Save conversation turn ──
     save_conversation_turn(conn, user_id, text, response)
     conn.close()
@@ -653,6 +674,172 @@ def _looks_like_done(text: str) -> bool:
     t = text.lower().strip()
     done_words = ("done", "✅", "✔️", "finished", "complete", "completed", "did it", "finished it", "all done", "that's done")
     return t in done_words or any(t.startswith(w) for w in done_words)
+
+
+# ── Silent HD Context Injection ──────────────────────────────────
+# Cache: only re-fetch HD data every 6 hours per profile
+_hd_cache = {}  # {profile_key: (timestamp, context_string)}
+
+def _fetch_silent_hd_context(conn, user_id: int) -> str | None:
+    """
+    Silently fetch Human Design deep_context and return a compact,
+    jargon-free context block for injection into the system prompt.
+    Cached per profile for 6 hours. Returns None if MCP unavailable.
+    """
+    global _hd_cache
+    
+    profile = _active_profile
+    now = datetime.now(timezone.utc)
+    
+    # Check cache
+    if profile in _hd_cache:
+        cached_time, cached_text = _hd_cache[profile]
+        if (now - cached_time).total_seconds() < 21600:  # 6 hours
+            return cached_text
+    
+    # Check if this session is "fresh" — no conversation in last 2 hours
+    cur = conn.execute(
+        "SELECT MAX(created_at) FROM conversation_history WHERE user_id = ?",
+        (user_id,)
+    )
+    row = cur.fetchone()
+    if row and row[0]:
+        try:
+            last_msg = datetime.fromisoformat(row[0])
+            if (now - last_msg).total_seconds() < 7200:  # 2 hours
+                return None  # Active conversation, don't re-inject
+        except Exception:
+            pass
+    
+    # Fetch HD data
+    try:
+        _ensure_mcp_path()
+        from mcp_server import get_deep_context
+        from ephemeris_engine import init_ephemeris
+        init_ephemeris()
+        
+        data = get_deep_context(profile)
+        if "error" in data:
+            return None
+        
+        chart = data.get("chart", {})
+        transits = data.get("transits", {})
+        conditioning = transits.get("conditioning", {})
+        circuit = data.get("circuit_analysis", {})
+        astro = data.get("astro_hd", {})
+        
+        # Compute open centers from all 9
+        all_centers = ["Head", "Ajna", "Throat", "G", "Heart/Ego", 
+                       "Solar Plexus", "Spleen", "Sacral", "Root"]
+        defined = set(chart.get("defined_centers", []))
+        open_centers = [c for c in all_centers if c not in defined]
+        
+        # Extract cross name from dict
+        cross_data = chart.get("incarnation_cross", {})
+        cross_name = cross_data if isinstance(cross_data, str) else cross_data.get("name", "Unknown")
+        
+        # Build a compact, jargon-free context block
+        lines = [
+            "[SILENT HD CONTEXT — DO NOT OUTPUT RAW DATA TO USER]",
+            "",
+            f"Active Profile: {profile}",
+            f"Type: {chart.get('type', 'Unknown')} — Strategy: {chart.get('strategy', '')}",
+            f"Authority: {chart.get('authority', '')}",
+            f"Profile: {chart.get('profile', '')}",
+            f"Cross: {cross_name}",
+            f"Defined Centers: {', '.join(chart.get('defined_centers', []))}",
+            f"Open Centers: {', '.join(open_centers)}",
+        ]
+        
+        channels = chart.get("defined_channels", [])
+        if channels:
+            lines.append("Channels: " + ", ".join(
+                f"{c['gates'][0]}-{c['gates'][1]} ({c['name']})" for c in channels
+            ))
+        
+        # Circuit analysis
+        if circuit:
+            lines.append(
+                f"Circuit: {circuit.get('individual', 0)} Individual, "
+                f"{circuit.get('tribal', 0)} Tribal, "
+                f"{circuit.get('collective', 0)} Collective "
+                f"({circuit.get('dominant', 'none')} dominant)"
+            )
+        
+        # Transit conditioning summary
+        conditioned = conditioning.get("conditioned_gates", [])
+        bridged = conditioning.get("bridged_channels", [])
+        if conditioned:
+            lines.append(f"Transit-conditioned gates: {conditioned}")
+        if bridged:
+            lines.append(f"Transit-bridged channels: {bridged}")
+        
+        # AstroHD gap
+        p_only = astro.get("personality_only", [])
+        d_only = astro.get("design_only", [])
+        if p_only or d_only:
+            lines.append(
+                f"AstroHD: {len(astro.get('personality_gates', []))} P-gates "
+                f"(how others experience), {len(astro.get('design_gates', []))} D-gates "
+                f"(unconscious). Gap: P-only={p_only[:5]}, D-only={d_only[:5]}"
+            )
+        
+        lines.append("")
+        lines.append(
+            "TRANSLATION RULES: Never output gate numbers, channel names, or HD jargon. "
+            "Translate everything into real-world psychological equivalents. "
+            "Frame everything as an experiment, not a diagnosis. "
+            "Goal: help the user catch their own patterns, not depend on you to flag them."
+        )
+        
+        context = "\n".join(lines)
+        _hd_cache[profile] = (now, context)
+        return context
+        
+    except Exception as e:
+        logger.warning(f"Silent HD fetch failed: {e}")
+        return None
+
+
+# ── Journal System ───────────────────────────────────────────────
+JOURNALS_DIR = Path(os.environ.get(
+    "NEXTSTEP_JOURNALS_DIR",
+    str(Path(__file__).parent / "journals")
+))
+
+def _get_recent_journal_context(user_id: int) -> str | None:
+    """Read the last 7 days of journal entries, return as context."""
+    try:
+        now = datetime.now(timezone.utc)
+        entries = []
+        for days_ago in range(7):
+            d = now - __import__('datetime').timedelta(days=days_ago)
+            journal_path = JOURNALS_DIR / str(d.year) / f"{d.month:02d}" / f"{d.day:02d}.md"
+            if journal_path.exists():
+                with open(journal_path) as f:
+                    entries.append(f.read().strip())
+        if entries:
+            return "[RECENT JOURNAL ENTRIES]\n" + "\n---\n".join(entries[-3:])
+    except Exception as e:
+        logger.warning(f"Journal read failed: {e}")
+    return None
+
+
+def _append_journal_entry(user_id: int, entry: str) -> None:
+    """Append a journal entry for today. Creates directory structure as needed."""
+    try:
+        now = datetime.now(timezone.utc)
+        day_dir = JOURNALS_DIR / str(now.year) / f"{now.month:02d}"
+        day_dir.mkdir(parents=True, exist_ok=True)
+        journal_path = day_dir / f"{now.day:02d}.md"
+        
+        timestamp = now.strftime("%H:%M UTC")
+        with open(journal_path, "a") as f:
+            f.write(f"\n### {timestamp}\n{entry}\n")
+        
+        logger.info(f"Journal entry written: {journal_path}")
+    except Exception as e:
+        logger.warning(f"Journal write failed: {e}")
 
 
 # ── Birth Data Extraction ────────────────────────────────────────
