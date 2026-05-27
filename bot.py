@@ -107,7 +107,7 @@ CLASSIFIER_PROMPT = """You are a message classifier for an AuDHD executive funct
 
 Return ONLY a JSON object with no other text:
 {
-  "type": "task_dump" | "done" | "command" | "chatter" | "birth_query",
+  "type": "task_dump" | "done" | "command" | "chatter" | "birth_query" | "relationship_query",
   "reasoning": "brief one-line explanation"
 }
 
@@ -115,7 +115,8 @@ Rules:
 - "task_dump": User is listing things they need to do. Even if messy/chaotic. Multi-line, comma-separated, bullet lists, stream-of-consciousness brain dumps.
 - "done": User is signaling completion of current task. Includes: "done", "✅", "finished", "complete", "did it", "that's done", "all done", etc.
 - "command": User is asking for status/list/help or using a command like /list, /next, /add, /status, /help, /start.
-- "birth_query": User is providing birth data — a date (with digits or month names), a time (digits + colon or @ or AM/PM), and a location (city/state/coordinates). Examples: "12/10/1989 @17:07 Simi Valley, CA", "March 5 1992, 2:30 PM in Austin TX", "1999-06-15 08:45 London UK". Route this to chart generation — do NOT treat as task_dump or chatter.
+- "birth_query": User is providing birth data — a date (with digits or month names), a time (digits + colon or @ or AM/PM), and a location (city/state/coordinates). Route this to chart generation — do NOT treat as task_dump or chatter.
+- "relationship_query": User is asking about compatibility, relationship dynamics, or friction with a specific family member. Includes: "me and [name]", "why do [name] and I clash", "compatibility with [name]", "me and my wife", "how do [name] and I work together", references to someone plus relationship language. Route to composite/synastry analysis.
 - "chatter": Everything else — greetings, questions, meta-commentary, "hey Jamie", "thanks", etc.
 
 User name: {name}
@@ -641,7 +642,13 @@ async def _handle_message_impl(update: Update, context: ContextTypes.DEFAULT_TYP
         conn.close()
         await handle_birth_query(update, text, user_id, display_name)
         return
-    
+
+    # ── HANDLE: relationship_query ──
+    if msg_type == "relationship_query":
+        conn.close()
+        await handle_relationship_query(update, text, display_name)
+        return
+
     # ── HANDLE: chatter ──
     if msg_type == "chatter":
         current_task_desc = None
@@ -786,9 +793,9 @@ def _ai_extract_birth(text: str) -> dict | None:
 If birth data IS present:
 {{
   "found": true,
-  "year": 1989, "month": 12, "day": 10,
-  "hour": 17.1167,
-  "location_str": "Simi Valley, CA"
+  "year": 2000, "month": 1, "day": 1,
+  "hour": 12.0,
+  "location_str": "City, Country"
 }}
 
 If birth data is NOT present:
@@ -874,6 +881,105 @@ async def handle_birth_query(update: Update, text: str, user_id: int, name: str)
     except Exception as e:
         logger.exception(f"Birth chart render error: {e}")
         await update.message.reply_text(f"⚠️ Chart rendering failed.\nError: {str(e)[:200]}")
+
+
+# ── Relationship Handler ──────────────────────────────────────────
+NAME_TO_KEY = {
+    "becca": "becca", "rebecca": "becca",
+    "benjamin": "benjamin", "ben": "benjamin",
+    "william": "william", "will": "william",
+    "victoria": "victoria", "tori": "victoria", "v": "victoria",
+    "michael": "michael", "mike": "michael",
+}
+
+def _find_relationship_target(text: str, self_name: str) -> str | None:
+    """Find which family member is being referenced in text."""
+    text_lower = text.lower()
+    for name, key in NAME_TO_KEY.items():
+        if name in text_lower and key != _active_profile:
+            return key
+    # Heuristic: "my wife" → becca
+    if any(phrase in text_lower for phrase in ["my wife", "wife", "becca"]):
+        return "becca"
+    return None
+
+
+async def handle_relationship_query(update: Update, text: str, self_name: str):
+    """Handle relationship questions by computing synastry composite."""
+    target = _find_relationship_target(text, self_name)
+
+    if not target:
+        # Try to extract using DeepSeek
+        family_list = ", ".join(f"{k} ({v['name']})" for k, v in _family_data.items())
+        prompt = f"Which family member is being referenced in this message? Family: {family_list}. Return just the profile key (e.g. 'becca') or 'none'.\nMessage: {text}"
+        try:
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[{"role": "system", "content": prompt}],
+                max_tokens=20, temperature=0.0,
+            )
+            ai_target = response.choices[0].message.content.strip().lower()
+            if ai_target in _family_data and ai_target != _active_profile:
+                target = ai_target
+        except Exception:
+            pass
+
+    if not target:
+        await update.message.reply_text(
+            f"🤔 I'm not sure which family member you're asking about.\n"
+            f"Try `/relate becca` or just say \"me and Becca\"."
+        )
+        return
+
+    target_name = _family_data.get(target, {}).get("name", target)
+    await update.message.reply_text(f"🔍 Analyzing {self_name} + {target_name} composite...")
+
+    try:
+        sys.path.insert(0, MCP_SRC)
+        from mcp_server import get_relationship_composite
+        from ephemeris_engine import init_ephemeris
+
+        init_ephemeris()
+        result = get_relationship_composite(_active_profile, target)
+
+        if "error" in result:
+            await update.message.reply_text(f"⚠️ {result['error']}")
+            return
+
+        comp = result["composite"]
+        companion = result.get("companion_channels", [])
+        electro = comp.get("electromagnetic_channels", [])
+        dominance = comp.get("dominance_channels", [])
+        centers = comp.get("centers_defined_together", [])
+
+        lines = [f"*{self_name} + {target_name} — Relationship Composite*\n"]
+
+        if companion:
+            names = ", ".join(f"{c['gates'][0]}-{c['gates'][1]} {c['name']}" for c in companion)
+            lines.append(f"🤝 *Companion:* {names}")
+            lines.append("_You both have this channel fully defined. Deep resonance._\n")
+
+        if electro:
+            lines.append(f"⚡ *Electromagnetic ({len(electro)} channels):*")
+            for e in electro:
+                lines.append(f"• {e['gates'][0]}-{e['gates'][1]} *{e['name']}*")
+                lines.append(f"  _{self_name} has Gate {e['a_has']}, {target_name} has Gate {e['b_has']}_")
+            lines.append("")
+
+        if dominance:
+            lines.append(f"🔄 *Dominance ({len(dominance)} channels):*")
+            for d in dominance:
+                lines.append(f"• {d['gates'][0]}-{d['gates'][1]} *{d['name']}* ({d['type']})")
+            lines.append("")
+
+        lines.append(f"🏠 *Centers defined together:* {', '.join(centers)} ({len(centers)}/9)")
+        lines.append(f"🔗 *Shared gates:* {result.get('shared_gate_count', 0)}")
+
+        await update.message.reply_text("\n".join(lines))
+
+    except Exception as e:
+        logger.exception(f"Relationship error: {e}")
+        await update.message.reply_text(f"⚠️ Relationship analysis failed.\nError: {str(e)[:200]}")
 
 
 # ── Image Commands ────────────────────────────────────────────────
@@ -1034,6 +1140,30 @@ async def who_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Unknown profile. Available: {available}")
 
 
+async def relate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show relationship composite between active profile and target."""
+    args = context.args
+    _load_family()
+    active_name = _family_data.get(_active_profile, {}).get("name", _active_profile)
+
+    if not args:
+        available = ", ".join(f"`{k}`" for k in _family_data.keys() if k != _active_profile)
+        await update.message.reply_text(f"Usage: `/relate NAME`\nAvailable: {available}")
+        return
+
+    target = args[0].lower()
+    if target not in _family_data:
+        await update.message.reply_text(f"Unknown profile '{target}'. Use /who to see family.")
+        return
+    if target == _active_profile:
+        await update.message.reply_text("That's you! Try `/relate becca` or another family member.")
+        return
+
+    # Reuse relationship query handler
+    fake_update = update
+    await handle_relationship_query(fake_update, f"me and {target}", active_name)
+
+
 # ── Main ─────────────────────────────────────────────────────────
 def main():
     if not DEEPSEEK_API_KEY:
@@ -1051,6 +1181,7 @@ def main():
     app.add_handler(CommandHandler("map", map_cmd))
     app.add_handler(CommandHandler("where", where_cmd))
     app.add_handler(CommandHandler("who", who_cmd))
+    app.add_handler(CommandHandler("relate", relate_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     logger.info(f"{ASSISTANT_NAME} is running! Press Ctrl+C to stop.")
