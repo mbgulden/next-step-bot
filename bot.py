@@ -919,6 +919,48 @@ async def map_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Map rendering failed.\nError: {str(e)[:200]}")
 
 
+async def where_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recommend best cities for career/love/family based on astrocartography."""
+    args = context.args
+    category = args[0].lower() if args else "general"
+    valid = {"career", "love", "family", "creativity", "general"}
+    if category not in valid:
+        category = "general"
+
+    await update.message.reply_text(f"🗺️ Scanning 95 cities for your best {category} locations...")
+
+    try:
+        from location_scorer import rank_cities
+        from ephemeris_engine import init_ephemeris, julday
+        from geo_resolver import local_to_utc
+
+        init_ephemeris()
+        b = DEFAULT_BIRTH
+        utc = local_to_utc(b["year"], b["month"], b["day"], b["hour"], b["location"])
+        jd = julday(utc[0], utc[1], utc[2], utc[3])
+
+        results = rank_cities(jd, category=category, top_n=10)
+
+        lines = [f"*Top {category.title()} Locations:*\n"]
+        for i, r in enumerate(results, 1):
+            city = r["city"]
+            country = r["country"]
+            score = r["normalized"][category]
+            top_p = r.get("top_planets", [])
+            planet_str = ", ".join(f"{p['planet']} {p['angle']}" for p in top_p[:3])
+            lines.append(f"{i}. *{city}, {country}* — {score:.1f}")
+            if planet_str:
+                lines.append(f"   _{planet_str}_")
+
+        await update.message.reply_text("\n".join(lines))
+    except ImportError as e:
+        logger.exception(f"Where import error: {e}")
+        await update.message.reply_text(f"⚠️ Location scorer not available.\nError: {str(e)[:150]}")
+    except Exception as e:
+        logger.exception(f"Where error: {e}")
+        await update.message.reply_text(f"⚠️ Location scan failed.\nError: {str(e)[:200]}")
+
+
 # ── Main ─────────────────────────────────────────────────────────
 def main():
     if not DEEPSEEK_API_KEY:
@@ -934,6 +976,7 @@ def main():
     app.add_handler(CommandHandler("status", lambda u, c: handle_message(u, c)))
     app.add_handler(CommandHandler("chart", chart_cmd))
     app.add_handler(CommandHandler("map", map_cmd))
+    app.add_handler(CommandHandler("where", where_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     logger.info(f"{ASSISTANT_NAME} is running! Press Ctrl+C to stop.")
