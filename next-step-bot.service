@@ -1,0 +1,17 @@
+[Unit]
+Description=Next Step Telegram Bot (AuDHD Executive Function Assistant)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/work/next-step-bot
+EnvironmentFile=/home/ubuntu/.hermes/profiles/orchestrator/.env
+ExecStart=/home/ubuntu/.local/share/pipx/venvs/hermes-agent/bin/python /home/ubuntu/work/next-step-bot/bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
