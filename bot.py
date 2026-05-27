@@ -63,10 +63,11 @@ DB_PATH = Path(os.environ.get(
 ASSISTANT_NAME = os.environ.get("NEXTSTEP_NAME", "Jamie")
 INSTANCE_PROFILE = os.environ.get("NEXTSTEP_PROFILE", "next-step")
 
-# DeepSeek API
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL) if DEEPSEEK_API_KEY else None
+# AI Provider (OpenAI-compatible)
+PROVIDER_API_KEY = os.environ.get("NEXTSTEP_API_KEY") or os.environ.get("DEEPSEEK_API_KEY", "")
+PROVIDER_BASE_URL = os.environ.get("NEXTSTEP_BASE_URL") or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+PROVIDER_MODEL = os.environ.get("NEXTSTEP_MODEL", "deepseek-chat")
+client = OpenAI(api_key=PROVIDER_API_KEY, base_url=PROVIDER_BASE_URL) if PROVIDER_API_KEY else None
 
 # ── Family Data ──────────────────────────────────────────────────
 _family_data = {}
@@ -438,7 +439,7 @@ def _call_jamie(messages: list[dict], max_tokens: int = 500, temperature: float 
         return "Hey! I'm having trouble connecting to my brain right now. Give me a moment?"
     
     response = client.chat.completions.create(
-        model="deepseek-chat",
+        model=PROVIDER_MODEL,
         messages=messages,
         max_tokens=max_tokens,
         temperature=temperature,
@@ -793,7 +794,7 @@ Message: {text}"""
     
     try:
         response = client.chat.completions.create(
-            model="deepseek-chat",
+            model=PROVIDER_MODEL,
             messages=[{"role": "system", "content": prompt}],
             max_tokens=150,
             temperature=0.0,
@@ -902,7 +903,7 @@ async def handle_relationship_query(update: Update, text: str, self_name: str):
         prompt = f"Which family member is being referenced in this message? Family: {family_list}. Return just the profile key (e.g. 'becca') or 'none'.\nMessage: {text}"
         try:
             response = client.chat.completions.create(
-                model="deepseek-chat",
+                model=PROVIDER_MODEL,
                 messages=[{"role": "system", "content": prompt}],
                 max_tokens=20, temperature=0.0,
             )
@@ -1154,8 +1155,8 @@ async def relate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Main ─────────────────────────────────────────────────────────
 def main():
-    if not DEEPSEEK_API_KEY:
-        logger.warning("DEEPSEEK_API_KEY not set. Running in fallback mode (no AI).")
+    if not PROVIDER_API_KEY:
+        logger.warning("NEXTSTEP_API_KEY or DEEPSEEK_API_KEY not set. Running in fallback mode (no AI).")
     
     logger.info(f"Starting Next Step bot as {ASSISTANT_NAME} ({INSTANCE_PROFILE})...")
     
