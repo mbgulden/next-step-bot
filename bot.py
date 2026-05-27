@@ -59,7 +59,7 @@ CLASSIFIER_PROMPT = """You are a message classifier for an AuDHD executive funct
 
 Return ONLY a JSON object with no other text:
 {
-  "type": "task_dump" | "done" | "command" | "chatter",
+  "type": "task_dump" | "done" | "command" | "chatter" | "birth_query",
   "reasoning": "brief one-line explanation"
 }
 
@@ -67,6 +67,7 @@ Rules:
 - "task_dump": User is listing things they need to do. Even if messy/chaotic. Multi-line, comma-separated, bullet lists, stream-of-consciousness brain dumps.
 - "done": User is signaling completion of current task. Includes: "done", "✅", "finished", "complete", "did it", "that's done", "all done", etc.
 - "command": User is asking for status/list/help or using a command like /list, /next, /add, /status, /help, /start.
+- "birth_query": User is providing birth data — a date (with digits or month names), a time (digits + colon or @ or AM/PM), and a location (city/state/coordinates). Examples: "12/10/1989 @17:07 Simi Valley, CA", "March 5 1992, 2:30 PM in Austin TX", "1999-06-15 08:45 London UK". Route this to chart generation — do NOT treat as task_dump or chatter.
 - "chatter": Everything else — greetings, questions, meta-commentary, "hey Jamie", "thanks", etc.
 
 User name: {name}
@@ -204,10 +205,35 @@ def fallback_classify(text: str) -> str:
         return "done"
     if t.startswith("/"):
         return "command"
+    # Check for birth data: date + time + location pattern
+    if _looks_like_birth_data(text):
+        return "birth_query"
     # If it has multiple lines, commas, or bullet points, treat as task dump
     if "\n" in t or "," in t or t.startswith("-") or t.startswith("*"):
         return "task_dump"
     return "chatter"
+
+
+def _looks_like_birth_data(text: str) -> bool:
+    """Quick heuristic: does this text contain date, time, and location indicators?"""
+    import re
+    # Date pattern: digits with separators or month names
+    has_date = bool(re.search(
+        r'\b\d{1,2}[/\-\.]\d{1,2}[/\-\.](?:\d{2}|\d{4})\b'
+        r'|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b',
+        text, re.IGNORECASE))
+    # Time pattern: digits with colon or @ or AM/PM
+    has_time = bool(re.search(
+        r'@\s*\d{1,2}(?::\d{2})?\s*(?:[AaPp][Mm])?'
+        r'|\b\d{1,2}:\d{2}\s*(?:[AaPp][Mm])?\b',
+        text))
+    # Location: contains a recognizable city/state/coord pattern
+    has_location = bool(re.search(
+        r'[A-Z][a-z]+(?:[, ]+\s*[A-Z]{2}\b|[A-Z][a-z]+)'
+        r'|latitude|longitude'
+        r'|\b\d+[°]\s*\d+[\']\s*[NSEW]',
+        text))
+    return has_date and has_time
 
 
 # ── AI Parsing ──────────────────────────────────────────────────
@@ -562,6 +588,12 @@ async def _handle_message_impl(update: Update, context: ContextTypes.DEFAULT_TYP
         conn.close()
         return
     
+    # ── HANDLE: birth_query ──
+    if msg_type == "birth_query":
+        conn.close()
+        await handle_birth_query(update, text, user_id, display_name)
+        return
+    
     # ── HANDLE: chatter ──
     if msg_type == "chatter":
         current_task_desc = None
@@ -579,6 +611,223 @@ async def _handle_message_impl(update: Update, context: ContextTypes.DEFAULT_TYP
     conn.close()
 
 
+# ── Birth Data Extraction ────────────────────────────────────────
+def extract_birth_data(text: str) -> dict | None:
+    """
+    Extract birth date, time, and location from freeform text.
+    Uses regex first, falls back to AI if pattern matching fails.
+    Returns dict with year/month/day/hour/minute/location_str or None.
+    """
+    import re
+    
+    # Try regex extraction first
+    result = _regex_extract_birth(text)
+    if result:
+        logger.info(f"Regex extracted birth data: {result}")
+        return result
+    
+    # Fall back to AI extraction
+    if client:
+        result = _ai_extract_birth(text)
+        if result:
+            logger.info(f"AI extracted birth data: {result}")
+            return result
+    
+    return None
+
+
+def _regex_extract_birth(text: str) -> dict | None:
+    """Regex-based birth data extractor."""
+    import re
+    
+    # Date: MM/DD/YYYY, MM-DD-YYYY, YYYY-MM-DD, Month DD YYYY
+    date_patterns = [
+        r'(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{2,4})',  # MM/DD/YYYY or DD/MM
+        r'(\d{4})[/\-\.](\d{1,2})[/\-\.](\d{1,2})',      # YYYY-MM-DD
+    ]
+    month_names = r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*'
+    month_name_pattern = rf'({month_names})[\s,]+(\d{{1,2}})[\s,]+(\d{{2,4}})'
+    
+    date_match = None
+    date_format = None  # "mdy", "ymd", "monthname"
+    
+    for pat in date_patterns:
+        m = re.search(pat, text)
+        if m:
+            g1, g2, g3 = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            date_match = (g1, g2, g3)
+            # Heuristic: if first > 12, it's YYYY-MM-DD
+            if g1 > 31:
+                date_format = "ymd"
+            else:
+                date_format = "mdy"
+            break
+    
+    if not date_match:
+        m = re.search(month_name_pattern, text, re.IGNORECASE)
+        if m:
+            month_map = {m.lower()[:3]: i for i, m in enumerate(
+                ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'], 1)}
+            mon = month_map.get(m.group(1).lower()[:3], 1)
+            # Group 2 is inner month capture, group 3 is day, group 4 is year
+            # due to nested (Jan|Feb|...) inside month_names group
+            day = int(m.group(3))
+            year = int(m.group(4))
+            date_match = (mon, day, year)
+            date_format = "monthname"
+    
+    if not date_match:
+        return None
+    
+    # Time: @HH:MM, HH:MM AM/PM, @HH [AM/PM]
+    time_match = re.search(
+        r'@\s*(\d{1,2})(?::(\d{2}))?\s*([AaPp][Mm])?'
+        r'|\b(\d{1,2}):(\d{2})\s*([AaPp][Mm])?\b',
+        text)
+    
+    if not time_match:
+        return None
+    
+    # Extract time components
+    if time_match.group(1) is not None:  # @ format
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2) or 0)
+        ampm = (time_match.group(3) or '').upper()
+    else:  # HH:MM format
+        hour = int(time_match.group(4))
+        minute = int(time_match.group(5))
+        ampm = (time_match.group(6) or '').upper()
+    
+    # Adjust for AM/PM
+    if ampm == 'PM' and hour != 12:
+        hour += 12
+    elif ampm == 'AM' and hour == 12:
+        hour = 0
+    
+    # Location: extract city/state/coords after the time
+    # Find everything after the time match
+    time_end = time_match.end()
+    location_raw = text[time_end:].strip().lstrip(',').lstrip('@').lstrip('in').strip()
+    
+    if not location_raw:
+        return None
+    
+    # Resolve the date
+    if date_format == "ymd":
+        year, month, day = date_match
+    elif date_format in ("mdy", "monthname"):
+        month, day, year = date_match
+    
+    # Handle 2-digit years
+    if year < 100:
+        year += 1900 if year > 50 else 2000
+    
+    return {
+        "year": year,
+        "month": month,
+        "day": day,
+        "hour": hour + minute / 60.0,
+        "location_str": location_raw,
+    }
+
+
+def _ai_extract_birth(text: str) -> dict | None:
+    """Use DeepSeek to extract birth data from text."""
+    prompt = f"""Extract birth data from the following message. Return ONLY a JSON object with no other text.
+
+If birth data IS present:
+{{
+  "found": true,
+  "year": 1989, "month": 12, "day": 10,
+  "hour": 17.1167,
+  "location_str": "Simi Valley, CA"
+}}
+
+If birth data is NOT present:
+{{"found": false}}
+
+Message: {text}"""
+    
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "system", "content": prompt}],
+            max_tokens=150,
+            temperature=0.0,
+        )
+        result = json.loads(response.choices[0].message.content.strip())
+        if result.get("found"):
+            return result
+    except Exception as e:
+        logger.error(f"AI birth extraction error: {e}")
+    return None
+
+
+async def handle_birth_query(update: Update, text: str, user_id: int, name: str) -> None:
+    """Handle a birth data message: compute and send the bodygraph chart."""
+    from cosmic_calculator import calculate_natal_chart
+    from image_generator import render_bodygraph
+    from ephemeris_engine import init_ephemeris
+    from geo_resolver import resolve_location, local_to_utc
+
+    birth = extract_birth_data(text)
+    if not birth:
+        await update.message.reply_text(
+            f"I think you're sharing birth data, but I couldn't parse it. "
+            f"Try:\n• `12/10/1989 @17:07 Simi Valley, CA`\n• `March 5 1992, 2:30 PM in Austin TX`"
+        )
+        return
+
+    await update.message.reply_text("🔮 Computing your Human Design chart... give me a moment!")
+
+    try:
+        init_ephemeris()
+
+        loc = birth.get("location_str", "UTC")
+
+        # Convert local birth time to UTC
+        utc_year, utc_month, utc_day, utc_hour = local_to_utc(
+            birth["year"], birth["month"], birth["day"],
+            birth["hour"], loc
+        )
+
+        birth_dt = datetime(utc_year, utc_month, utc_day,
+                           int(utc_hour), int((utc_hour % 1) * 60))
+
+        # Resolve geo coordinates
+        geo = resolve_location(loc)
+        lat = geo.get("lat", 0.0)
+        lon = geo.get("lon", 0.0)
+
+        chart = calculate_natal_chart(
+            name=name,
+            birth_dt=birth_dt,
+            lat=lat, lon=lon,
+            timezone=geo.get("timezone", "UTC"),
+        )
+
+        output_path = f"/tmp/bodygraph_{user_id}.png"
+        render_bodygraph(chart, output_path)
+
+        with open(output_path, "rb") as f:
+            channels_text = ', '.join(
+                f"{c['gates'][0]}-{c['gates'][1]}" for c in chart.get('defined_channels', []))
+            caption = (
+                f"*{chart['hd_type']} | {chart['profile']} | {chart['authority']}*\n"
+                f"_{chart['strategy']}_\n\n"
+                f"Defined: {', '.join(chart.get('defined_centers', []))}\n"
+                f"Channels: {channels_text}"
+            )
+            await update.message.reply_photo(photo=f, caption=caption)
+
+    except ImportError as e:
+        logger.exception(f"Birth chart import error: {e}")
+        await update.message.reply_text(f"⚠️ Couldn't load the chart engine.\nError: {str(e)[:150]}")
+    except Exception as e:
+        logger.exception(f"Birth chart render error: {e}")
+        await update.message.reply_text(f"⚠️ Chart rendering failed.\nError: {str(e)[:200]}")
+
+
 # ── Image Commands ────────────────────────────────────────────────
 async def chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate and send a bodygraph chart image."""
@@ -590,12 +839,18 @@ async def chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from cosmic_calculator import calculate_natal_chart
         from image_generator import render_bodygraph
         from ephemeris_engine import init_ephemeris
+        from geo_resolver import local_to_utc
 
         init_ephemeris()
 
         b = DEFAULT_BIRTH
-        birth_dt = datetime(b["year"], b["month"], b["day"],
-                           int(b["hour"]), int((b["hour"] % 1) * 60))
+        # Convert LOCAL birth time to UTC (calculate_natal_chart expects UTC)
+        utc_year, utc_month, utc_day, utc_hour = local_to_utc(
+            b["year"], b["month"], b["day"], b["hour"],
+            b["location"]
+        )
+        birth_dt = datetime(utc_year, utc_month, utc_day,
+                           int(utc_hour), int((utc_hour % 1) * 60))
         
         chart = calculate_natal_chart(
             name=b["name"], birth_dt=birth_dt,
@@ -630,11 +885,17 @@ async def map_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from astro_cartography import calculate_cartography_lines
         from image_generator import render_cartography_map
         from ephemeris_engine import init_ephemeris, julday
+        from geo_resolver import local_to_utc
 
         init_ephemeris()
 
         b = DEFAULT_BIRTH
-        jd = julday(b["year"], b["month"], b["day"], b["hour"])
+        # Convert LOCAL birth time to UTC before computing Julian Day
+        utc_year, utc_month, utc_day, utc_hour = local_to_utc(
+            b["year"], b["month"], b["day"], b["hour"],
+            b["location"]
+        )
+        jd = julday(utc_year, utc_month, utc_day, utc_hour)
         lines = calculate_cartography_lines(jd)
 
         output_path = f"/tmp/cartography_{update.effective_user.id}.png"
