@@ -37,7 +37,10 @@ DEFAULT_BIRTH = {
 }
 
 # ── Config ──────────────────────────────────────────────────────
-BOT_TOKEN = "***REDACTED***"
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+if not BOT_TOKEN:
+    # Legacy fallback — will be removed after token rotation
+    BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 DB_PATH = Path(__file__).parent / "next_step.db"
 ASSISTANT_NAME = "Jamie"
 
