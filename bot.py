@@ -28,13 +28,58 @@ from openai import OpenAI
 MCP_SRC = "/home/ubuntu/work/OpenHumanDesignMCP/hd-mcp-server/src"
 sys.path.insert(0, MCP_SRC)
 
-# Default birth data (Michael)
-DEFAULT_BIRTH = {
-    "name": "Michael",
-    "year": 1989, "month": 12, "day": 10, "hour": 17.1167,  # 5:07 PM
-    "location": "Simi Valley CA",
-    "lat": 34.2694, "lon": -118.7815,
-}
+# Family data — loaded from family.json, falls back to Michael
+FAMILY_PATH = Path(__file__).parent / "family.json"
+_family_data = {}
+_active_profile = "michael"
+
+def _load_family():
+    global _family_data, _active_profile
+    try:
+        with open(FAMILY_PATH) as f:
+            data = json.load(f)
+            _family_data = data.get("family", {})
+            _active_profile = data.get("active", "michael")
+    except Exception:
+        _family_data = {}
+
+def _get_active_birth():
+    _load_family()
+    member = _family_data.get(_active_profile, {})
+    if member:
+        return {
+            "name": member.get("name", "Michael"),
+            "year": member["year"], "month": member["month"],
+            "day": member["day"], "hour": member["hour"],
+            "location": member.get("location", "UTC"),
+            "lat": member.get("lat", 0), "lon": member.get("lon", 0),
+        }
+    # Ultimate fallback
+    return {
+        "name": "Michael", "year": 1989, "month": 12, "day": 10,
+        "hour": 17.1167, "location": "Simi Valley CA",
+        "lat": 34.2694, "lon": -118.7815,
+    }
+
+def _set_active_profile(profile: str) -> bool:
+    global _active_profile
+    _load_family()
+    if profile in _family_data:
+        _active_profile = profile
+        # Persist to file
+        try:
+            with open(FAMILY_PATH) as f:
+                data = json.load(f)
+            data["active"] = profile
+            with open(FAMILY_PATH, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+        return True
+    return False
+
+# Active birth data — call this whenever you need the current profile
+DEFAULT_BIRTH = _get_active_birth()  # initial load, also use _get_active_birth() dynamically
 
 # ── Config ──────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -846,7 +891,7 @@ async def chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         init_ephemeris()
 
-        b = DEFAULT_BIRTH
+        b = _get_active_birth()
         # Convert LOCAL birth time to UTC (calculate_natal_chart expects UTC)
         utc_year, utc_month, utc_day, utc_hour = local_to_utc(
             b["year"], b["month"], b["day"], b["hour"],
@@ -892,7 +937,7 @@ async def map_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         init_ephemeris()
 
-        b = DEFAULT_BIRTH
+        b = _get_active_birth()
         # Convert LOCAL birth time to UTC before computing Julian Day
         utc_year, utc_month, utc_day, utc_hour = local_to_utc(
             b["year"], b["month"], b["day"], b["hour"],
@@ -927,7 +972,8 @@ async def where_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if category not in valid:
         category = "general"
 
-    await update.message.reply_text(f"🗺️ Scanning 95 cities for your best {category} locations...")
+    b = _get_active_birth()
+    await update.message.reply_text(f"🗺️ Scanning 95 cities for {b['name']}'s best {category} locations...")
 
     try:
         from location_scorer import rank_cities
@@ -935,13 +981,12 @@ async def where_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from geo_resolver import local_to_utc
 
         init_ephemeris()
-        b = DEFAULT_BIRTH
         utc = local_to_utc(b["year"], b["month"], b["day"], b["hour"], b["location"])
         jd = julday(utc[0], utc[1], utc[2], utc[3])
 
         results = rank_cities(jd, category=category, top_n=10)
 
-        lines = [f"*Top {category.title()} Locations:*\n"]
+        lines = [f"*Top {category.title()} Locations for {b['name']}:*\n"]
         for i, r in enumerate(results, 1):
             city = r["city"]
             country = r["country"]
@@ -961,6 +1006,34 @@ async def where_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Location scan failed.\nError: {str(e)[:200]}")
 
 
+async def who_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List family members or switch active profile."""
+    args = context.args
+    _load_family()
+
+    if not args:
+        # List all members
+        lines = ["*Family Profiles:*\n"]
+        for key, member in _family_data.items():
+            marker = "👉" if key == _active_profile else "  "
+            lines.append(f"{marker} `{key}` — {member['name']} ({member.get('hd_type','?')} {member.get('profile','?')})")
+        lines.append(f"\nType `/who NAME` to switch. Active: *{_active_profile}*")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    profile = args[0].lower()
+    if _set_active_profile(profile):
+        member = _family_data[profile]
+        await update.message.reply_text(
+            f"✅ Switched to *{member['name']}*\n"
+            f"{member.get('hd_type','?')} | {member.get('profile','?')} | {member.get('authority','?')}\n\n"
+            f"/chart /map /where now use {member['name']}'s data."
+        )
+    else:
+        available = ", ".join(f"`{k}`" for k in _family_data.keys())
+        await update.message.reply_text(f"Unknown profile. Available: {available}")
+
+
 # ── Main ─────────────────────────────────────────────────────────
 def main():
     if not DEEPSEEK_API_KEY:
@@ -977,6 +1050,7 @@ def main():
     app.add_handler(CommandHandler("chart", chart_cmd))
     app.add_handler(CommandHandler("map", map_cmd))
     app.add_handler(CommandHandler("where", where_cmd))
+    app.add_handler(CommandHandler("who", who_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     logger.info(f"{ASSISTANT_NAME} is running! Press Ctrl+C to stop.")
