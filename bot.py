@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """
 Next Step — Executive Function Telegram Bot for AuDHD
-Built for Michael (3/5 Projector, Splenic Authority)
 Assistant: Jamie | Powered by DeepSeek API
 
 ARCHITECTURE:
-  Every user message → DeepSeek classifier → 
-    "task_dump" → parse + micro-scope → save ONE atomic step → serve
-    "done" → mark complete → celebrate → serve next
-    "command" → handle directly
-    "chatter" → respond conversationally
+  Single unified conversation pipeline with conversation history,
+  tool loop for HD data, and natural task + Human Design coaching.
+
+PORTABLE: All paths and IDs configured via environment variables.
+  See README.md for deployment options.
+
+ENV VARS:
+  TELEGRAM_BOT_TOKEN    (required)  Telegram bot token from @BotFather
+  DEEPSEEK_API_KEY      (required)  DeepSeek API key
+  NEXTSTEP_MCP_SRC      (optional)  Path to MCP server src/ dir (default: ./mcp-server/src)
+  NEXTSTEP_FAMILY_PATH  (optional)  Path to family.json (default: ./family.json)
+  NEXTSTEP_DB_PATH      (optional)  Path to SQLite DB (default: ./data/next_step.db)
+  NEXTSTEP_NAME         (optional)  Assistant name (default: Jamie)
+  NEXTSTEP_PROFILE      (optional)  Instance identifier for logging (default: next-step)
+  DEEPSEEK_BASE_URL     (optional)  DeepSeek API base URL (default: https://api.deepseek.com)
 """
 import os
 import sys
@@ -24,14 +33,52 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from openai import OpenAI
 
-# MCP import path
-MCP_SRC = "/home/ubuntu/work/OpenHumanDesignMCP/hd-mcp-server/src"
-sys.path.insert(0, MCP_SRC)
+# ── Portable Config ──────────────────────────────────────────────
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+if not BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is required")
 
-# Family data — loaded from family.json, falls back to Michael
-FAMILY_PATH = Path(__file__).parent / "family.json"
+# MCP Server path — where to find the Human Design calculation engine
+MCP_SRC = os.environ.get(
+    "NEXTSTEP_MCP_SRC",
+    str(Path(__file__).parent / "mcp-server" / "src")
+)
+if not Path(MCP_SRC).is_dir():
+    logger_warn = logging.getLogger("next-step")
+    logger_warn.warning(f"MCP server not found at {MCP_SRC} — HD tools will be unavailable")
+
+# Family data path
+FAMILY_PATH = Path(os.environ.get(
+    "NEXTSTEP_FAMILY_PATH",
+    str(Path(__file__).parent / "family.json")
+))
+
+# Database path (creates parent dirs automatically)
+DB_PATH = Path(os.environ.get(
+    "NEXTSTEP_DB_PATH",
+    str(Path(__file__).parent / "data" / "next_step.db")
+))
+
+# Identity
+ASSISTANT_NAME = os.environ.get("NEXTSTEP_NAME", "Jamie")
+INSTANCE_PROFILE = os.environ.get("NEXTSTEP_PROFILE", "next-step")
+
+# DeepSeek API
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL) if DEEPSEEK_API_KEY else None
+
+# ── Family Data ──────────────────────────────────────────────────
 _family_data = {}
-_active_profile = "michael"
+_active_profile = os.environ.get("NEXTSTEP_ACTIVE_PROFILE", "michael")
+
+# Lazy MCP import helper — adds MCP_SRC to sys.path once
+_mcp_path_added = False
+def _ensure_mcp_path():
+    global _mcp_path_added
+    if not _mcp_path_added and Path(MCP_SRC).is_dir():
+        sys.path.insert(0, MCP_SRC)
+        _mcp_path_added = True
 
 def _load_family():
     global _family_data, _active_profile
@@ -78,22 +125,6 @@ def _set_active_profile(profile: str) -> bool:
         return True
     return False
 
-# Active birth data — call this whenever you need the current profile
-DEFAULT_BIRTH = _get_active_birth()  # initial load, also use _get_active_birth() dynamically
-
-# ── Config ──────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-if not BOT_TOKEN:
-    # Legacy fallback — will be removed after token rotation
-    BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-DB_PATH = Path(__file__).parent / "next_step.db"
-ASSISTANT_NAME = "Jamie"
-
-# DeepSeek API
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL) if DEEPSEEK_API_KEY else None
-
 # ── Logging ─────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -122,6 +153,7 @@ def _load_soul() -> str:
 
 # ── Database ─────────────────────────────────────────────────────
 def get_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("""
         CREATE TABLE IF NOT EXISTS tasks (
@@ -216,7 +248,7 @@ def _execute_tool(tool_line: str, user_id: int, display_name: str) -> str:
     logger.info(f"Jamie requested tool: {tool_name} args={args}")
     
     try:
-        sys.path.insert(0, MCP_SRC)
+        _ensure_mcp_path()
         from mcp_server import get_deep_context, get_relationship_composite
         from cosmic_calculator import calculate_natal_chart
         from ephemeris_engine import init_ephemeris
@@ -891,7 +923,7 @@ async def handle_relationship_query(update: Update, text: str, self_name: str):
     await update.message.reply_text(f"🔍 Analyzing {self_name} + {target_name} composite...")
 
     try:
-        sys.path.insert(0, MCP_SRC)
+        _ensure_mcp_path()
         from mcp_server import get_relationship_composite
         from ephemeris_engine import init_ephemeris
 
@@ -1125,7 +1157,7 @@ def main():
     if not DEEPSEEK_API_KEY:
         logger.warning("DEEPSEEK_API_KEY not set. Running in fallback mode (no AI).")
     
-    logger.info(f"Starting Next Step bot as {ASSISTANT_NAME}...")
+    logger.info(f"Starting Next Step bot as {ASSISTANT_NAME} ({INSTANCE_PROFILE})...")
     
     app = Application.builder().token(BOT_TOKEN).build()
     
@@ -1140,7 +1172,7 @@ def main():
     app.add_handler(CommandHandler("relate", relate_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    logger.info(f"{ASSISTANT_NAME} is running! Press Ctrl+C to stop.")
+    logger.info(f"{ASSISTANT_NAME} ({INSTANCE_PROFILE}) is running! Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
