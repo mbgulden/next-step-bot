@@ -102,90 +102,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger("next-step")
 
-# ── System Prompts ──────────────────────────────────────────────
-CLASSIFIER_PROMPT = """You are a message classifier for an AuDHD executive function assistant bot named Jamie. Analyze the user's message and classify it as exactly ONE type.
+# ── Unified Jamie System Prompt ──────────────────────────────────
+SOUL_PATH = Path(__file__).parent / "SOUL.md"
+SOUL_PROMPT = None
 
-Return ONLY a JSON object with no other text:
-{
-  "type": "task_dump" | "done" | "command" | "chatter" | "birth_query" | "relationship_query",
-  "reasoning": "brief one-line explanation"
-}
+def _load_soul() -> str:
+    """Load Jamie's soul prompt from SOUL.md, with current state injected."""
+    global SOUL_PROMPT
+    if SOUL_PROMPT is None:
+        try:
+            with open(SOUL_PATH) as f:
+                SOUL_PROMPT = f.read()
+            # Replace "Fred" with "Jamie" if still present
+            SOUL_PROMPT = SOUL_PROMPT.replace("Fred", "Jamie")
+        except Exception:
+            SOUL_PROMPT = "You are Jamie, Michael's executive function and Human Design assistant."
+    return SOUL_PROMPT
 
-Rules:
-- "task_dump": User is listing things they need to do. Even if messy/chaotic. Multi-line, comma-separated, bullet lists, stream-of-consciousness brain dumps.
-- "done": User is signaling completion of current task. Includes: "done", "✅", "finished", "complete", "did it", "that's done", "all done", etc.
-- "command": User is asking for status/list/help or using a command like /list, /next, /add, /status, /help, /start.
-- "birth_query": User is providing birth data — a date (with digits or month names), a time (digits + colon or @ or AM/PM), and a location (city/state/coordinates). Route this to chart generation — do NOT treat as task_dump or chatter.
-- "relationship_query": User is asking about compatibility, relationship dynamics, or friction with a specific family member. Includes: "me and [name]", "why do [name] and I clash", "compatibility with [name]", "me and my wife", "how do [name] and I work together", references to someone plus relationship language. Route to composite/synastry analysis.
-- "chatter": Everything else — greetings, questions, meta-commentary, "hey Jamie", "thanks", etc.
-
-User name: {name}
-Message: {message}"""
-
-PARSE_PROMPT = """You are Jamie, an executive function assistant for {name}, who has an AuDHD brain and is a 3/5 Projector (learns by experimenting, needs concrete steps).
-
-{name} just dumped their chaotic thoughts. Your job:
-1. Strip out ALL conversational filler, meta-dialogue, greetings, "hey Jamie", etc.
-2. Parse the remaining content into distinct individual tasks.
-3. For the FIRST task, micro-scope it: if it's vague ("fix auth bug"), break it into a stupidly small mechanical first step ("Open the auth module file at src/auth.py").
-
-Return ONLY a JSON object with no other text:
-{{
-  "parsed_tasks": ["task 1", "task 2", "task 3"],
-  "served_step": "The exact atomic next step to show the user. Must be concrete and mechanical.",
-  "greeting": "Brief, encouraging acknowledgment (1 sentence max)."
-}}
-
-Rules:
-- NEVER show the full task list in served_step.
-- Every served_step must be ONE concrete action. "Open X file" not "Fix X bug".
-- Be warm and playful but concise.
-- {name} is a bottom-up thinker. Give mechanical bricks, never vague buildings."""
-
-MICROSCOPE_PROMPT = """You are Jamie, an executive function assistant. The next task in the queue is:
-
-TASK: {task}
-
-If this task is already specific and atomic (like "Open the file at src/auth.py"), return it as-is.
-If it's vague or large, break it into a stupidly small, mechanical first step.
-
-Return ONLY a JSON object:
-{{
-  "served_step": "The exact atomic next step. One concrete action.",
-  "was_scoped": true if you had to break it down, false if it was already atomic
-}}
-
-Rules:
-- ONE concrete action only. "Open the terminal" or "Navigate to src/" — not both.
-- Mechanical language. Action verbs. File paths when relevant.
-- Bottom-up friendly. No vague goals."""
-
-DONE_RESPONSE_PROMPT = """You are Jamie, an executive function assistant for {name} (AuDHD, 3/5 Projector). They just completed a task.
-
-1. Give a short, high-energy celebration (1 sentence). Make it novel — never the same style twice.
-2. Tell them what's next (the step_provided below).
-
-Return ONLY a JSON object:
-{{
-  "celebration": "Your novel celebration text with emoji",
-  "transition": "Brief handoff to the next step (1 sentence max)"
-}}
-
-Current next step: {next_step}
-
-Celebration style guide: Use emoji, be playful, vary between:
-- Video game references ("🎉 PEW PEW! Task obliterated!")
-- Sports metaphors ("🏆 Another win for the highlight reel!")
-- Superhero framing ("🦾 Task eliminated. You're unstoppable!")
-- Cheerful absurdity ("💥 BOOM. That task never stood a chance!")
-NEVER repeat the same style twice. Be creative."""
-
-CHATTER_RESPONSE_PROMPT = """You are Jamie, an executive function assistant for {name} (AuDHD, 3/5 Projector, Splenic authority). They just said something conversational.
-
-Respond warmly and concisely (1-2 sentences). If appropriate, gently remind them of their current task or encourage them to dump what's on their mind.
-
-Message: {message}
-Current task: {current_task}"""
 
 # ── Database ─────────────────────────────────────────────────────
 def get_db():
@@ -219,190 +152,158 @@ def get_db():
             created_at TEXT DEFAULT (datetime('now'))
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS conversation_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_conv_user ON conversation_history(user_id, created_at)")
     conn.commit()
     return conn
 
 
-# ── AI Classifier ────────────────────────────────────────────────
-def classify_message(text: str, name: str) -> str:
-    """Classify user message as task_dump, done, command, or chatter."""
-    if not client:
-        return fallback_classify(text)
-    
-    try:
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{
-                "role": "system",
-                "content": CLASSIFIER_PROMPT.format(name=name, message=text)
-            }],
-            max_tokens=100,
-            temperature=0.0,
+# ── Conversation History ─────────────────────────────────────────
+MAX_HISTORY = 20  # last N exchanges to keep per user
+
+def get_conversation_history(conn, user_id: int) -> list[dict]:
+    """Return the last MAX_HISTORY messages for this user as {"role": str, "content": str}."""
+    cur = conn.execute(
+        "SELECT role, content FROM conversation_history WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (user_id, MAX_HISTORY * 2)  # up to N pairs
+    )
+    rows = cur.fetchall()
+    rows.reverse()  # oldest first
+    return [{"role": r, "content": c} for r, c in rows]
+
+def save_conversation_turn(conn, user_id: int, user_msg: str, assistant_msg: str):
+    """Persist one user+assistant exchange."""
+    conn.execute(
+        "INSERT INTO conversation_history (user_id, role, content) VALUES (?, 'user', ?)",
+        (user_id, user_msg)
+    )
+    conn.execute(
+        "INSERT INTO conversation_history (user_id, role, content) VALUES (?, 'assistant', ?)",
+        (user_id, assistant_msg)
+    )
+    # Prune old history beyond MAX_HISTORY
+    conn.execute("""
+        DELETE FROM conversation_history WHERE user_id = ? AND id NOT IN (
+            SELECT id FROM conversation_history WHERE user_id = ? ORDER BY id DESC LIMIT ?
         )
-        result = json.loads(response.choices[0].message.content.strip())
-        return result.get("type", "chatter")
-    except Exception as e:
-        logger.error(f"Classifier error: {e}")
-        return fallback_classify(text)
+    """, (user_id, user_id, MAX_HISTORY * 2))
+    conn.commit()
 
 
-def fallback_classify(text: str) -> str:
-    """Fallback classifier when AI is unavailable."""
-    t = text.lower().strip()
-    done_words = ("done", "✅", "✔️", "finished", "complete", "did it", "finished it")
-    if t in done_words or any(t.startswith(w) for w in done_words):
-        return "done"
-    if t.startswith("/"):
-        return "command"
-    # Check for birth data: date + time + location pattern
-    if _looks_like_birth_data(text):
-        return "birth_query"
-    # If it has multiple lines, commas, or bullet points, treat as task dump
-    if "\n" in t or "," in t or t.startswith("-") or t.startswith("*"):
-        return "task_dump"
-    return "chatter"
-
-
-def _looks_like_birth_data(text: str) -> bool:
-    """Quick heuristic: does this text contain date, time, and location indicators?"""
+# ── Tool Execution for Jamie ─────────────────────────────────────
+def _execute_tool(tool_line: str, user_id: int, display_name: str) -> str:
+    """
+    Execute a Jamie tool request and return the result text.
+    Format: [TOOL:name:arg1,arg2,...]
+    """
     import re
-    # Date pattern: digits with separators or month names
-    has_date = bool(re.search(
-        r'\b\d{1,2}[/\-\.]\d{1,2}[/\-\.](?:\d{2}|\d{4})\b'
-        r'|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b',
-        text, re.IGNORECASE))
-    # Time pattern: digits with colon or @ or AM/PM
-    has_time = bool(re.search(
-        r'@\s*\d{1,2}(?::\d{2})?\s*(?:[AaPp][Mm])?'
-        r'|\b\d{1,2}:\d{2}\s*(?:[AaPp][Mm])?\b',
-        text))
-    # Location: contains a recognizable city/state/coord pattern
-    has_location = bool(re.search(
-        r'[A-Z][a-z]+(?:[, ]+\s*[A-Z]{2}\b|[A-Z][a-z]+)'
-        r'|latitude|longitude'
-        r'|\b\d+[°]\s*\d+[\']\s*[NSEW]',
-        text))
-    return has_date and has_time
-
-
-# ── AI Parsing ──────────────────────────────────────────────────
-def parse_task_dump(text: str, name: str) -> dict:
-    """Parse a chaotic task dump into individual tasks + first micro-step."""
-    if not client:
-        return fallback_parse(text, name)
+    m = re.match(r'\[TOOL:(\w+):?(.*?)\]', tool_line.strip())
+    if not m:
+        return "[Tool parse error]"
+    
+    tool_name = m.group(1)
+    args_str = m.group(2)
+    args = [a.strip() for a in args_str.split(",") if a.strip()] if args_str else []
+    
+    logger.info(f"Jamie requested tool: {tool_name} args={args}")
     
     try:
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{
-                "role": "system",
-                "content": PARSE_PROMPT.format(name=name)
-            }, {
-                "role": "user",
-                "content": text
-            }],
-            max_tokens=400,
-            temperature=0.3,
-        )
-        result = json.loads(response.choices[0].message.content.strip())
-        return result
-    except Exception as e:
-        logger.error(f"Parse error: {e}")
-        return fallback_parse(text, name)
-
-
-def fallback_parse(text: str, name: str) -> dict:
-    """Fallback parser when AI unavailable."""
-    lines = []
-    for line in text.split("\n"):
-        stripped = line.strip().lstrip("-*•0123456789. ")
-        if stripped and len(stripped) > 3:
-            lines.append(stripped)
-    if not lines:
-        return {"parsed_tasks": [], "served_step": f"Hey {name}! I didn't catch any tasks. Try listing them out?", "greeting": ""}
-    return {
-        "parsed_tasks": lines,
-        "served_step": f"Got it. Your first step: {lines[0]}",
-        "greeting": f"Got it, {name}."
-    }
-
-
-def micro_scope_task(task: str) -> dict:
-    """Break a vague task into an atomic micro-step."""
-    if not client:
-        return {"served_step": task, "was_scoped": False}
-    
-    # Quick check: if task is already specific/short, don't scope
-    if len(task.split()) <= 6:
-        return {"served_step": task, "was_scoped": False}
-    
-    try:
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{
-                "role": "system",
-                "content": MICROSCOPE_PROMPT.format(task=task)
-            }],
-            max_tokens=150,
-            temperature=0.3,
-        )
-        result = json.loads(response.choices[0].message.content.strip())
-        return result
-    except Exception as e:
-        logger.error(f"Micro-scope error: {e}")
-        return {"served_step": task, "was_scoped": False}
-
-
-def generate_done_response(name: str, next_step: str) -> dict:
-    """Generate celebration + transition for task completion."""
-    if not client:
-        return {
-            "celebration": "✅ Done! Great work.",
-            "transition": f"Next up: {next_step}" if next_step else "Queue is empty! 🎉"
-        }
-    
-    try:
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{
-                "role": "system",
-                "content": DONE_RESPONSE_PROMPT.format(name=name, next_step=next_step or "Nothing — queue is empty!")
-            }],
-            max_tokens=100,
-            temperature=0.9,
-        )
-        result = json.loads(response.choices[0].message.content.strip())
-        return result
-    except Exception as e:
-        logger.error(f"Done response error: {e}")
-        return {
-            "celebration": "✅ Done!",
-            "transition": f"Next up: {next_step}" if next_step else "Queue is empty! 🎉"
-        }
-
-
-def generate_chatter_response(name: str, message: str, current_task: str = None) -> str:
-    """Generate a conversational response."""
-    if not client:
-        return f"Hey {name}! 👋 Ready to tackle some tasks? Just dump what's on your mind."
-    
-    try:
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{
-                "role": "system",
-                "content": CHATTER_RESPONSE_PROMPT.format(
-                    name=name, message=message,
-                    current_task=current_task or "No current task"
+        sys.path.insert(0, MCP_SRC)
+        from mcp_server import get_deep_context, get_relationship_composite
+        from cosmic_calculator import calculate_natal_chart
+        from ephemeris_engine import init_ephemeris
+        init_ephemeris()
+        
+        # ── deep_context ──
+        if tool_name == "deep_context":
+            profile_a = args[0] if args else _active_profile
+            profile_b = args[1] if len(args) > 1 else None
+            
+            if profile_b:
+                result = get_deep_context(profile_a, profile_b)
+            else:
+                result = get_deep_context(profile_a)
+            
+            # If no HD data yet (profile not in family.json with birth data),
+            # fall back to active profile's birth data
+            if "error" in result and profile_a == _active_profile:
+                b = _get_active_birth()
+                from datetime import datetime as dt
+                from geo_resolver import local_to_utc
+                utc = local_to_utc(b["year"], b["month"], b["day"], b["hour"], b["location"])
+                birth_dt = dt(utc[0], utc[1], utc[2], int(utc[3]), int((utc[3] % 1) * 60))
+                chart = calculate_natal_chart(
+                    name=b["name"], birth_dt=birth_dt,
+                    lat=b.get("lat", 0), lon=b.get("lon", 0),
+                    timezone="America/Los_Angeles"
                 )
-            }],
-            max_tokens=80,
-            temperature=0.7,
-        )
-        return response.choices[0].message.content.strip()
+                result = {"chart": chart, "note": "Deep context via direct calculation"}
+            
+            return json.dumps(result, indent=2, default=str)
+        
+        # ── transits ──
+        elif tool_name == "transits":
+            profile = args[0] if args else _active_profile
+            result = get_deep_context(profile)
+            if "error" not in result and "transits" in result:
+                return json.dumps({"transits": result["transits"]}, indent=2, default=str)
+            return json.dumps(result, indent=2, default=str)
+        
+        # ── relate ──
+        elif tool_name == "relate":
+            if len(args) < 2:
+                return json.dumps({"error": "Need two profile names"})
+            result = get_relationship_composite(args[0], args[1])
+            return json.dumps(result, indent=2, default=str)
+        
+        # ── map ──
+        elif tool_name == "map":
+            profile = args[0] if args else _active_profile
+            b = _get_active_birth()
+            from astro_cartography import calculate_cartography_lines
+            from ephemeris_engine import julday
+            from geo_resolver import local_to_utc
+            utc = local_to_utc(b["year"], b["month"], b["day"], b["hour"], b["location"])
+            jd = julday(utc[0], utc[1], utc[2], utc[3])
+            lines = calculate_cartography_lines(jd)
+            # Return top locations summary
+            top = []
+            for line in lines[:10]:
+                top.append(f"{line.get('planet','?')} {line.get('angle','?')}: {line.get('lat',0):.1f}°, {line.get('lon',0):.1f}°")
+            return json.dumps({"profile": profile, "top_lines": top, "total_lines": len(lines)}, indent=2)
+        
+        # ── list (tasks) ──
+        elif tool_name == "list":
+            conn2 = get_db()
+            tasks = get_all_pending(conn2, user_id)
+            conn2.close()
+            if not tasks:
+                return "No pending tasks."
+            return "\n".join(f"{i+1}. {t[1]}" for i, t in enumerate(tasks))
+        
+        # ── done ──
+        elif tool_name == "done":
+            conn2 = get_db()
+            next_task = complete_current(conn2, user_id)
+            conn2.close()
+            if next_task:
+                return f"Task marked complete. Next: {next_task[1]}"
+            return "Task marked complete. Queue is empty!"
+        
+        else:
+            return f"[Unknown tool: {tool_name}]"
+    
     except Exception as e:
-        logger.error(f"Chatter error: {e}")
-        return f"Hey {name}! Ready to tackle some tasks?"
+        logger.exception(f"Tool execution error ({tool_name}): {e}")
+        return f"[Tool error: {str(e)[:200]}]"
 
 
 # ── Task Management ─────────────────────────────────────────────
@@ -479,6 +380,40 @@ def get_all_pending(conn, user_id):
     return cur.fetchall()
 
 
+# ── Jamie's Unified Conversation ─────────────────────────────────
+def _extract_tasks_from_text(text: str) -> list[str]:
+    """
+    Fast, local task extraction without an extra AI call.
+    Splits on newlines/bullets/commas, filters garbage.
+    """
+    import re
+    lines = []
+    # Split on common delimiters
+    for chunk in re.split(r'[\n;•·▪▸►●○◉]|, (?=[A-Z])', text):
+        chunk = chunk.strip().lstrip("-*•0123456789. )] ")
+        # Filter out conversational filler
+        if not chunk or len(chunk) < 5:
+            continue
+        if chunk.lower().startswith(("hey", "hi ", "hello", "jamie", "thanks", "ok ")):
+            continue
+        lines.append(chunk)
+    return lines
+
+
+def _call_jamie(messages: list[dict], max_tokens: int = 500, temperature: float = 0.7) -> str:
+    """Call DeepSeek with the given messages and return the response text."""
+    if not client:
+        return "Hey! I'm having trouble connecting to my brain right now. Give me a moment?"
+    
+    response = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    return response.choices[0].message.content.strip()
+
+
 # ── Telegram Handlers ────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -486,31 +421,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db()
     conn.execute("INSERT OR REPLACE INTO state (user_id, user_name) VALUES (?, ?)", (user.id, name))
     conn.commit()
+    
+    # Clear old conversation history for fresh start
+    conn.execute("DELETE FROM conversation_history WHERE user_id = ?", (user.id,))
+    conn.commit()
     conn.close()
     
     await update.message.reply_text(
-        f"Hey {name}! 👋 I'm **{ASSISTANT_NAME}**, your Next Step assistant.\n\n"
-        "Here's how it works:\n"
-        "• Dump your tasks, thoughts, chaos — I'll organize it all\n"
-        "• I'll give you exactly ONE thing to do at a time\n"
-        "• Say **done** and I'll celebrate + give you the next step\n"
-        "• I'll NEVER show you the full list (unless you ask)\n\n"
-        "Ready? Send me what's on your mind! 🚀"
+        f"Hey {name}! 👋 I'm **{ASSISTANT_NAME}**, your personal assistant.\n\n"
+        "I can help you stay on top of tasks, and I understand your Human Design deeply. "
+        "Just talk to me naturally — dump tasks, ask about your chart, whatever's on your mind.\n\n"
+        "**Quick tips:**\n"
+        "• Dump your chaos — I'll give you ONE thing to do at a time\n"
+        "• Say **done** and I'll celebrate + serve the next step\n"
+        "• Ask me about your chart, transits, or compatibility anytime\n"
+        "• I'll never show the full list unless you ask\n\n"
+        "Ready when you are! 🚀"
     )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"**{ASSISTANT_NAME} — Your Next Step Assistant**\n\n"
-        "**Commands:**\n"
-        "/start — Start fresh\n"
-        "/help — This message\n"
-        "/list — See all pending tasks\n"
-        "/status — See current task\n\n"
-        "**Quick actions:**\n"
-        "Just say 'done' or ✅ to complete\n"
-        "Dump anything and I'll organize it\n"
-        "I parse EVERYTHING through AI for smart task extraction!"
+        f"**{ASSISTANT_NAME} — Your Assistant**\n\n"
+        "**Task Commands:**\n"
+        "/start — Fresh start\n"
+        "/list — See pending tasks\n"
+        "/status — Current task\n\n"
+        "**Human Design:**\n"
+        "/chart — Your bodygraph\n"
+        "/map — Astrocartography\n"
+        "/where [career|love|family] — Best locations\n"
+        "/who — Family profiles\n"
+        "/relate [name] — Compatibility\n\n"
+        "**Or just talk to me naturally.** Dump tasks, ask questions, "
+        "explore your chart — I flow between everything smoothly."
     )
 
 
@@ -525,10 +469,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception(f"FATAL in message handler: {e}")
         try:
             await update.message.reply_text(
-                f"⚠️ Jamie hit a snag processing that.\nError: {str(e)[:200]}\n\nTry again or type /start to reset."
+                f"⚠️ I hit a snag. Try again?\nError: {str(e)[:200]}"
             )
         except Exception:
-            logger.error("Could not send error reply to user")
+            logger.error("Could not send error reply")
 
 
 async def _handle_message_impl(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -537,133 +481,145 @@ async def _handle_message_impl(update: Update, context: ContextTypes.DEFAULT_TYP
     current_id, stored_name = get_or_create_state(conn, user_id)
     display_name = stored_name or name
     
-    # ── STEP 1: Classify the message ──
-    msg_type = classify_message(text, display_name)
-    logger.info(f"[{display_name}] Classified as: {msg_type} | Text: {text[:80]}")
-
-    # ── HANDLE: "done" ──
-    if msg_type == "done":
-        next_task = complete_current(conn, user_id)
-        
-        if next_task:
-            # Micro-scope the next task
-            scoped = micro_scope_task(next_task[1])
-            served = scoped.get("served_step", next_task[1])
-            
-            # Update the task's micro_step_current
-            conn.execute("UPDATE tasks SET micro_step_current = ? WHERE id = ?", (served, next_task[0]))
-            conn.commit()
-            
-            # Generate celebration
-            done_resp = generate_done_response(display_name, served)
-            msg = f"{done_resp['celebration']}\n\n{done_resp['transition']}"
-        else:
-            done_resp = generate_done_response(display_name, None)
-            msg = f"{done_resp['celebration']}\n\n{done_resp['transition']}"
-        
-        conn.close()
-        await update.message.reply_text(msg)
-        return
-    
-    # ── HANDLE: /list ──
-    if msg_type == "command" and ("/list" in text.lower() or "list" in text.lower()):
+    # ── Fast-path: explicit /list ──
+    if text.lower().strip().startswith("/list") or text.lower().strip() == "list":
         tasks = get_all_pending(conn, user_id)
-        conn.close()
         if not tasks:
-            await update.message.reply_text("Queue is empty! 🎉 Dump what's on your mind!")
+            conn.close()
+            await update.message.reply_text("Queue is empty! 🎉 Want to dump what's on your mind?")
         else:
             task_list = "\n".join(f"{i+1}. {t[1]}" for i, t in enumerate(tasks))
-            await update.message.reply_text(f"**Your pending tasks:**\n\n{task_list}\n\nSay 'done' to complete the current one!")
+            conn.close()
+            await update.message.reply_text(f"**Your pending tasks:**\n\n{task_list}\n\nReply 'done' when you complete the current one!")
         return
     
-    # ── HANDLE: /status ──
-    if msg_type == "command" and ("/status" in text.lower() or "status" in text.lower()):
-        current_id, _ = get_or_create_state(conn, user_id)
-        conn.close()
+    # ── Fast-path: explicit /status ──
+    if text.lower().strip().startswith("/status") or text.lower().strip() == "status":
         if current_id:
             cur = conn.execute("SELECT description, micro_step_current FROM tasks WHERE id = ?", (current_id,))
             row = cur.fetchone()
             if row:
                 step = row[1] or row[0]
+                conn.close()
                 await update.message.reply_text(f"You're working on: **{step}**\n\nReply 'done' when complete!")
-            else:
-                await update.message.reply_text("No current task. Dump some tasks to begin!")
-        else:
-            await update.message.reply_text("No current task. Dump some tasks to begin!")
-        return
-    
-    # ── HANDLE: /help or other commands ──
-    if msg_type == "command":
+                return
         conn.close()
-        await help_cmd(update, context)
+        await update.message.reply_text("No current task. Dump some tasks to begin!")
         return
     
-    # ── HANDLE: task_dump ──
-    if msg_type == "task_dump":
-        # Parse through DeepSeek
-        parsed = parse_task_dump(text, display_name)
-        tasks = parsed.get("parsed_tasks", [])
-        served_step = parsed.get("served_step", "")
-        greeting = parsed.get("greeting", "")
-        
-        if not tasks:
+    # ── Fast-path: explicit "done" ──
+    if _looks_like_done(text):
+        next_task = complete_current(conn, user_id)
+        if next_task:
+            # Re-read current state after completion
+            current_id, _ = get_or_create_state(conn, user_id)
+        else:
             conn.close()
-            await update.message.reply_text(f"Hey {display_name}! I didn't catch any tasks in that. Try listing them out clearly?")
+            await update.message.reply_text("🎉 Queue cleared! You're all done. Want to add something new?")
             return
-        
-        # Save raw dump
-        dump_id = save_raw_dump(conn, user_id, text, len(tasks))
-        
-        # Add parsed tasks
-        first_id, first_desc = add_tasks(conn, user_id, tasks, dump_id)
-        
-        if first_id:
-            # Micro-scope the first task
-            scoped = micro_scope_task(first_desc)
-            served = scoped.get("served_step", served_step or first_desc)
-            
-            # Save the micro-step
-            conn.execute("UPDATE tasks SET micro_step_current = ? WHERE id = ?", (served, first_id))
-            
-            # Set as current task
-            conn.execute("UPDATE state SET current_task_id = ? WHERE user_id = ?", (first_id, user_id))
-            conn.commit()
-            
-            await update.message.reply_text(f"{greeting} {served}")
-        else:
-            conn.commit()
-            await update.message.reply_text(f"Got it, {display_name}! But I couldn't extract tasks. Try again?")
-        
-        conn.close()
-        return
     
-    # ── HANDLE: birth_query ──
-    if msg_type == "birth_query":
-        conn.close()
-        await handle_birth_query(update, text, user_id, display_name)
-        return
-
-    # ── HANDLE: relationship_query ──
-    if msg_type == "relationship_query":
-        conn.close()
-        await handle_relationship_query(update, text, display_name)
-        return
-
-    # ── HANDLE: chatter ──
-    if msg_type == "chatter":
-        current_task_desc = None
-        if current_id:
-            cur = conn.execute("SELECT micro_step_current, description FROM tasks WHERE id = ?", (current_id,))
-            row = cur.fetchone()
-            if row:
-                current_task_desc = row[0] or row[1]
-        
-        response = generate_chatter_response(display_name, text, current_task_desc)
-        conn.close()
-        await update.message.reply_text(response)
-        return
+    # Get current task for context injection
+    current_task_desc = None
+    if current_id:
+        cur = conn.execute(
+            "SELECT micro_step_current, description FROM tasks WHERE id = ?", (current_id,)
+        )
+        row = cur.fetchone()
+        if row:
+            current_task_desc = row[0] or row[1]
     
+    # ── Build the messages array ──
+    soul = _load_soul()
+    
+    # Inject current state into the system prompt
+    state_context = f"\n\n[CURRENT STATE]\nActive profile: {_active_profile} ({display_name})"
+    if current_task_desc:
+        state_context += f"\nCurrent task: {current_task_desc}"
+    else:
+        state_context += "\nNo current task. Queue is empty."
+    state_context += f"\nFamily profiles available: {', '.join(_family_data.keys())}"
+    state_context += f"\nToday is {datetime.now(timezone.utc).strftime('%A, %B %d %Y, %H:%M UTC')}"
+    
+    messages = [
+        {"role": "system", "content": soul + state_context}
+    ]
+    
+    # Add conversation history
+    history = get_conversation_history(conn, user_id)
+    messages.extend(history)
+    
+    # Add the user's message
+    messages.append({"role": "user", "content": text})
+    
+    # ── Call Jamie ──
+    logger.info(f"[{display_name}] Unified Jamie processing: {text[:80]}")
+    response = _call_jamie(messages, max_tokens=500)
+    
+    # ── Tool loop: Jamie can request data ──
+    tool_loop_guard = 0
+    while "[TOOL:" in response and tool_loop_guard < 4:
+        tool_loop_guard += 1
+        
+        # Extract the first tool line
+        tool_start = response.index("[TOOL:")
+        tool_end = response.index("]", tool_start) + 1
+        tool_line = response[tool_start:tool_end]
+        
+        # Execute the tool
+        tool_result = _execute_tool(tool_line, user_id, display_name)
+        
+        # Inject tool result into conversation
+        messages.append({"role": "assistant", "content": response})
+        messages.append({"role": "user", "content": f"[Tool result for {tool_line}]\n{tool_result}"})
+        
+        # Call Jamie again with the tool data
+        response = _call_jamie(messages, max_tokens=600)
+    
+    # ── Post-process: if Jamie suggests tasks, store them ──
+    # Check if response contains task-like structure (numbered list, bullet actions)
+    # and if the user's message looks like a brain dump
+    is_dump = _looks_like_task_dump(text)
+    if is_dump:
+        tasks_found = _extract_tasks_from_text(text)
+        if tasks_found:
+            dump_id = save_raw_dump(conn, user_id, text, len(tasks_found))
+            first_id, first_desc = add_tasks(conn, user_id, tasks_found, dump_id)
+            if first_id:
+                conn.execute(
+                    "UPDATE state SET current_task_id = ? WHERE user_id = ?",
+                    (first_id, user_id)
+                )
+                conn.commit()
+                logger.info(f"[{display_name}] Auto-parsed {len(tasks_found)} tasks from dump")
+    
+    # ── Save conversation turn ──
+    save_conversation_turn(conn, user_id, text, response)
     conn.close()
+    
+    # ── Send response ──
+    await update.message.reply_text(response)
+
+
+def _looks_like_task_dump(text: str) -> bool:
+    """Heuristic: does this look like someone dumping tasks?"""
+    t = text.strip()
+    # Multi-line, bullet points, or lots of punctuation-separated items
+    line_count = len([l for l in t.split("\n") if len(l.strip()) > 10])
+    if line_count >= 2:
+        return True
+    if t.startswith("-") or t.startswith("*") or t.startswith("•"):
+        return True
+    # Comma-separated task-like phrases
+    if t.count(",") >= 2 and len(t) > 80:
+        return True
+    return False
+
+
+def _looks_like_done(text: str) -> bool:
+    """Heuristic: is this a task completion signal?"""
+    t = text.lower().strip()
+    done_words = ("done", "✅", "✔️", "finished", "complete", "completed", "did it", "finished it", "all done", "that's done")
+    return t in done_words or any(t.startswith(w) for w in done_words)
 
 
 # ── Birth Data Extraction ────────────────────────────────────────
