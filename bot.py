@@ -26,7 +26,9 @@ import json
 import sqlite3
 import asyncio
 import logging
-from datetime import datetime, timezone
+import threading
+import time
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from telegram import Update
@@ -195,6 +197,18 @@ def get_db():
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_conv_user ON conversation_history(user_id, created_at)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scheduled_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            message TEXT NOT NULL,
+            due_at TEXT NOT NULL,
+            recurring INTEGER DEFAULT 0,
+            sent INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sched_user_due ON scheduled_messages(user_id, due_at)")
     conn.commit()
     return conn
 
@@ -479,7 +493,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "**Task Commands:**\n"
         "/start — Fresh start\n"
         "/list — See pending tasks\n"
-        "/status — Current task\n\n"
+        "/status — Current task\n"
+        "/remind HH:MM message — Set a reminder\n\n"
+        "**Daily Check-in:**\n"
+        "/daily 09:00 — I'll message you every day\n"
+        "/daily off — Turn off daily messages\n\n"
         "**Human Design:**\n"
         "/chart — Your bodygraph\n"
         "/map — Astrocartography\n"
@@ -575,10 +593,21 @@ async def _handle_message_impl(update: Update, context: ContextTypes.DEFAULT_TYP
     
     # ── Silent HD pre-fetch ──
     # If no recent conversation history, inject HD data silently
-    # so Jamie wakes up already knowing the chart — no visible tool call
+    # so the assistant wakes up already knowing the chart — no visible tool call
     hd_context = _fetch_silent_hd_context(conn, user_id)
     if hd_context:
         state_context += "\n\n" + hd_context
+    
+    # ── Fresh transit context (1-hour cache) ──
+    # Transits change throughout the day; keep them current
+    transit_context = _fetch_silent_transit_context(conn, user_id)
+    if transit_context:
+        state_context += "\n\n" + transit_context
+    
+    # ── Topic learning (adapts to what user cares about) ──
+    topic_hints = _get_topic_persona_hints(conn, user_id)
+    if topic_hints:
+        state_context += "\n\n" + topic_hints
     
     # ── Journal context ──
     journal_context = _get_recent_journal_context(user_id)
@@ -677,8 +706,19 @@ def _looks_like_done(text: str) -> bool:
 
 
 # ── Silent HD Context Injection ──────────────────────────────────
-# Cache: only re-fetch HD data every 6 hours per profile
+# HD cache: 6-hour TTL for natal chart, 1-hour TTL for transits
 _hd_cache = {}  # {profile_key: (timestamp, context_string)}
+_transit_cache = {}  # {profile_key: (timestamp, transit_context_string)}
+
+# Topic learning: track what users ask about to pre-load relevant data
+TOPIC_KEYWORDS = {
+    "relationship": ["becca", "benjamin", "william", "victoria", "wife", "son", "daughter", 
+                     "family", "partner", "marriage", "kid", "children", "husband"],
+    "career": ["work", "job", "career", "business", "project", "money", "client", "sheplantedatree"],
+    "energy": ["tired", "energy", "exhausted", "drained", "rest", "sleep", "battery", "burnout"],
+    "direction": ["purpose", "direction", "meaning", "path", "next", "future", "what now", "stuck", "lost"],
+    "emotions": ["feel", "feeling", "emotional", "anxious", "overwhelmed", "stress", "mood"],
+}
 
 def _fetch_silent_hd_context(conn, user_id: int) -> str | None:
     """
@@ -801,6 +841,148 @@ def _fetch_silent_hd_context(conn, user_id: int) -> str | None:
         return None
 
 
+def _fetch_silent_transit_context(conn, user_id: int) -> str | None:
+    """
+    Fetch ONLY current transits (1-hour cache).
+    These change throughout the day, so we refresh more frequently.
+    Returns compact transit conditioning context or None.
+    """
+    global _transit_cache
+    
+    profile = _active_profile
+    now = datetime.now(timezone.utc)
+    
+    # Check transit-specific cache (1 hour)
+    if profile in _transit_cache:
+        cached_time, cached_text = _transit_cache[profile]
+        if (now - cached_time).total_seconds() < 3600:  # 1 hour
+            return cached_text
+    
+    # Only refresh if user was active recently (within last hour)
+    cur = conn.execute(
+        "SELECT MAX(created_at) FROM conversation_history WHERE user_id = ?",
+        (user_id,)
+    )
+    row = cur.fetchone()
+    if row and row[0]:
+        try:
+            last_msg = datetime.fromisoformat(row[0])
+            if (now - last_msg).total_seconds() > 3600:
+                return None  # User hasn't been active, skip transit refresh
+        except Exception:
+            pass
+    
+    try:
+        _ensure_mcp_path()
+        from mcp_server import calculate_chart_with_transits
+        from ephemeris_engine import init_ephemeris
+        init_ephemeris()
+        
+        birth_data = _get_active_birth()
+        data = calculate_chart_with_transits(
+            name=birth_data["name"],
+            year=birth_data["year"], month=birth_data["month"],
+            day=birth_data["day"], hour=birth_data["hour"],
+            lat=birth_data["lat"], lon=birth_data["lon"],
+            location=birth_data["location"]
+        )
+        
+        if "error" in data:
+            return None
+        
+        transits = data.get("transits", {})
+        conditioning = transits.get("conditioning", {})
+        conditioned_gates = conditioning.get("conditioned_gates", [])
+        bridged = conditioning.get("bridged_channels", [])
+        transit_hints = transits.get("interpretation_hints", [])
+        
+        if not conditioned_gates and not bridged and not transit_hints:
+            return None  # Nothing meaningful to report
+        
+        lines = [
+            "[FRESH TRANSITS — 1-hour window — DO NOT OUTPUT RAW]",
+            f"Conditioned gates active now: {conditioned_gates}" if conditioned_gates else "",
+            f"Bridged channels: {bridged}" if bridged else "",
+        ]
+        if transit_hints:
+            lines.append("Transit themes: " + "; ".join(transit_hints[:3]))
+        
+        context = "\n".join(l for l in lines if l)
+        if context:
+            _transit_cache[profile] = (now, context)
+            return context
+        
+    except Exception as e:
+        logger.debug(f"Transit fetch skipped: {e}")
+    
+    return None
+
+
+def _detect_recent_topics(text: str) -> list:
+    """Scan text for topic keywords. Returns list of detected topics."""
+    text_lower = text.lower()
+    detected = []
+    for topic, keywords in TOPIC_KEYWORDS.items():
+        for kw in keywords:
+            if kw in text_lower:
+                detected.append(topic)
+                break
+    return detected if detected else ["general"]
+
+
+def _get_topic_persona_hints(conn, user_id: int) -> str | None:
+    """
+    Analyze recent conversation topics to pre-load relevant HD angles.
+    Learns what the user cares about and adapts data priority.
+    Returns context hints string or None.
+    """
+    # Look at last 10 messages for topic patterns
+    cur = conn.execute(
+        """SELECT content FROM conversation_history 
+           WHERE user_id = ? AND role = 'user'
+           ORDER BY created_at DESC LIMIT 10""",
+        (user_id,)
+    )
+    recent = [row[0] for row in cur.fetchall()]
+    
+    if not recent:
+        return None
+    
+    # Count topic occurrences
+    topic_counts = {}
+    for msg in recent:
+        for topic in _detect_recent_topics(msg):
+            topic_counts[topic] = topic_counts.get(topic, 0) + 1
+    
+    if not topic_counts:
+        return None
+    
+    # Determine dominant topics (those appearing in >20% of messages)
+    threshold = max(1, len(recent) * 0.2)
+    dominant = [t for t, c in topic_counts.items() if c >= threshold]
+    
+    if not dominant:
+        return None
+    
+    # Build persona hints based on dominant topics
+    hints = []
+    if "relationship" in dominant:
+        hints.append("User frequently asks about relationships. Pre-load synastry awareness.")
+    if "career" in dominant:
+        hints.append("User is career/business focused. Frame HD insights around work alignment.")
+    if "energy" in dominant:
+        hints.append("User is managing energy/burnout. Prioritize open-center awareness and rest advocacy.")
+    if "direction" in dominant:
+        hints.append("User seeks direction/purpose. Emphasize Profile and Cross insights.")
+    if "emotions" in dominant:
+        hints.append("User processes emotions. Focus on emotional authority/definition patterns.")
+    
+    if hints:
+        return "[TOPIC AWARENESS — Learned from recent conversations]\n" + "\n".join(f"• {h}" for h in hints)
+    
+    return None
+
+
 # ── Journal System ───────────────────────────────────────────────
 JOURNALS_DIR = Path(os.environ.get(
     "NEXTSTEP_JOURNALS_DIR",
@@ -840,6 +1022,361 @@ def _append_journal_entry(user_id: int, entry: str) -> None:
         logger.info(f"Journal entry written: {journal_path}")
     except Exception as e:
         logger.warning(f"Journal write failed: {e}")
+
+
+# ── Scheduler ─────────────────────────────────────────────────────
+# Background thread for reminders, daily check-ins, and proactive messages
+_scheduler_app = None  # Application reference, set in main()
+_scheduler_event_loop = None
+
+def _start_scheduler(app):
+    """Start background scheduler thread. Called from main()."""
+    global _scheduler_app, _scheduler_event_loop
+    _scheduler_app = app
+    _scheduler_event_loop = asyncio.get_event_loop()
+    t = threading.Thread(target=_scheduler_loop, daemon=True, name="next-step-scheduler")
+    t.start()
+    logger.info("Scheduler thread started")
+
+def _scheduler_loop():
+    """Background loop: check for due messages every 30 seconds."""
+    while True:
+        try:
+            _process_due_scheduled()
+        except Exception as e:
+            logger.error(f"Scheduler error: {e}")
+        time.sleep(30)
+
+def _send_telegram(chat_id: int, text: str):
+    """Send a Telegram message from the scheduler thread."""
+    try:
+        future = asyncio.run_coroutine_threadsafe(
+            _scheduler_app.bot.send_message(chat_id=chat_id, text=text),
+            _scheduler_event_loop
+        )
+        future.result(timeout=10)
+    except Exception as e:
+        logger.error(f"Scheduler send failed for {chat_id}: {e}")
+
+def _process_due_scheduled():
+    """Check for due scheduled messages. Send + handle recurring."""
+    conn = get_db()
+    try:
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        cur = conn.execute(
+            "SELECT id, user_id, message, recurring FROM scheduled_messages "
+            "WHERE due_at <= ? AND sent = 0 ORDER BY due_at",
+            (now,)
+        )
+        due = cur.fetchall()
+        
+        for msg_id, user_id, message, recurring in due:
+            _send_telegram(user_id, message)
+            
+            if recurring:
+                # Reschedule for tomorrow at same time
+                conn.execute(
+                    "UPDATE scheduled_messages SET sent = 0, "
+                    "due_at = datetime(due_at, '+1 day') WHERE id = ?",
+                    (msg_id,)
+                )
+                logger.info(f"Recurring message {msg_id} rescheduled for next day")
+            else:
+                conn.execute("UPDATE scheduled_messages SET sent = 1 WHERE id = ?", (msg_id,))
+                logger.info(f"One-shot message {msg_id} sent and marked complete")
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Scheduler DB error: {e}")
+    finally:
+        conn.close()
+
+
+# ── Daily Personalized Message Generator ──────────────────────────
+def _generate_daily_message(user_id: int, profile: str) -> str:
+    """
+    Generate a hyper-personalized daily message using:
+    - Current transits against the user's natal chart
+    - Recent journal entries (what they've been working through)
+    - Conversation topics (what they've been asking about)
+    - Time of day / day of week awareness
+    
+    Uses the AI (Jamie/Sage) to craft the message in their voice.
+    Falls back to a warm generic message if MCP/AI unavailable.
+    """
+    try:
+        # Gather context
+        birth_data = _get_active_birth()
+        conn = get_db()
+        
+        # Recent journals
+        journal_context = _get_recent_journal_context(user_id) or ""
+        
+        # Recent conversation topics
+        cur = conn.execute(
+            "SELECT content FROM conversation_history WHERE user_id = ? AND role = 'user' "
+            "ORDER BY created_at DESC LIMIT 5",
+            (user_id,)
+        )
+        recent_convos = [row[0] for row in cur.fetchall()]
+        conn.close()
+        
+        convo_summary = " | ".join(recent_convos[:3]) if recent_convos else "new user"
+        
+        # Try to get fresh transits
+        transit_context = ""
+        try:
+            _ensure_mcp_path()
+            from mcp_server import calculate_chart_with_transits
+            from ephemeris_engine import init_ephemeris
+            init_ephemeris()
+            data = calculate_chart_with_transits(
+                name=birth_data["name"],
+                year=birth_data["year"], month=birth_data["month"],
+                day=birth_data["day"], hour=birth_data["hour"],
+                lat=birth_data["lat"], lon=birth_data["lon"],
+                location=birth_data["location"]
+            )
+            if "error" not in data:
+                transits = data.get("transits", {})
+                conditioning = transits.get("conditioning", {})
+                conditioned = conditioning.get("conditioned_gates", [])
+                bridged = conditioning.get("bridged_channels", [])
+                hints = transits.get("interpretation_hints", [])
+                if conditioned or bridged or hints:
+                    transit_context = (
+                        f"Active transit gates: {conditioned}. "
+                        f"Bridged: {bridged}. Themes: {'; '.join(hints[:3])}"
+                    )
+        except Exception as e:
+            logger.debug(f"Daily: transit fetch skipped: {e}")
+        
+        # Build the prompt
+        now = datetime.now(timezone.utc)
+        day_str = now.strftime("%A")
+        time_str = now.strftime("%H:%M UTC")
+        
+        prompt = f"""You are {ASSISTANT_NAME}, sending your daily check-in to {birth_data['name']}. 
+
+Craft ONE short, warm, personalized message (2-4 sentences max). Make it feel like a friend who deeply knows them — warm, grounded, and slightly whimsical. Never robotic. Never generic astrology.
+
+CONTEXT:
+- Day: {day_str}, {time_str}
+- Their HD: {birth_data['name']} is a {profile} — {"energy is finite, needs invitation not push, gut-knowing authority" if "Projector" in str(profile) else ""}
+- Recent conversations: {convo_summary[:200]}
+- Journal themes (recent): {journal_context[:300] if journal_context else "none yet"}
+- Transit conditions today: {transit_context if transit_context else "quiet day, nothing major crossing"}
+
+RULES:
+1. NEVER output HD jargon, gate numbers, or channel names
+2. Ground it in THEIR actual life — reference their recent struggles/goals naturally
+3. Include ONE tiny, optional experiment for the day (framed as an invitation)
+4. Make them smile. Warmth > wisdom. Fun > formal.
+5. If you can't find anything specific, default to: "Just checking in. How's your energy? 🌿"
+
+Your message:"""
+
+        if client:
+            try:
+                response = client.chat.completions.create(
+                    model=PROVIDER_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=200,
+                    temperature=0.9
+                )
+                return response.choices[0].message.content.strip()
+            except Exception:
+                pass
+        
+        # Fallback
+        return (
+            f"Good morning, {birth_data['name']}! 🌿\n\n"
+            f"It's {day_str}. Just checking in — how's your energy today? "
+            f"No pressure, no agenda. I'm just glad you're here."
+        )
+        
+    except Exception as e:
+        logger.error(f"Daily message generation failed: {e}")
+        return f"Hey! Just a quick hello to say I'm thinking of you today. 💚"
+
+
+def _set_daily_checkin(conn, user_id: int, time_str: str, profile_hint: str = ""):
+    """Create or update a recurring daily check-in at specified time (HH:MM UTC)."""
+    # Clean old recurring messages for this user
+    conn.execute(
+        "DELETE FROM scheduled_messages WHERE user_id = ? AND recurring = 1",
+        (user_id,)
+    )
+    
+    # Calculate next occurrence
+    now = datetime.now(timezone.utc)
+    target_hour, target_min = map(int, time_str.split(":"))
+    target = now.replace(hour=target_hour, minute=target_min, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)  # Tomorrow if time already passed
+    
+    due_str = target.strftime("%Y-%m-%dT%H:%M:%S")
+    
+    # The message will be generated fresh each day by the scheduler
+    # Store a placeholder — the scheduler calls _generate_daily_message before sending
+    conn.execute(
+        "INSERT INTO scheduled_messages (user_id, message, due_at, recurring) "
+        "VALUES (?, ?, ?, 1)",
+        (user_id, f"__DAILY_GENERATE__:{profile_hint}", due_str)
+    )
+    conn.commit()
+    logger.info(f"Daily check-in set for user {user_id} at {time_str} UTC (next: {due_str})")
+
+
+# Update process_due_scheduled to handle __DAILY_GENERATE__
+_original_process_due = _process_due_scheduled
+
+def _process_due_scheduled():
+    """Check for due scheduled messages. Generate daily messages on-the-fly."""
+    conn = get_db()
+    try:
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        cur = conn.execute(
+            "SELECT id, user_id, message, recurring FROM scheduled_messages "
+            "WHERE due_at <= ? AND sent = 0 ORDER BY due_at",
+            (now,)
+        )
+        due = cur.fetchall()
+        
+        for msg_id, user_id, message, recurring in due:
+            # Handle daily generate placeholder
+            if message.startswith("__DAILY_GENERATE__"):
+                profile_hint = message.split(":", 1)[1] if ":" in message else ""
+                message = _generate_daily_message(user_id, profile_hint)
+            
+            _send_telegram(user_id, message)
+            
+            if recurring:
+                conn.execute(
+                    "UPDATE scheduled_messages SET sent = 0, "
+                    "due_at = datetime(due_at, '+1 day') WHERE id = ?",
+                    (msg_id,)
+                )
+            else:
+                conn.execute("UPDATE scheduled_messages SET sent = 1 WHERE id = ?", (msg_id,))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Scheduler DB error: {e}")
+    finally:
+        conn.close()
+
+
+# ── Command Handlers ──────────────────────────────────────────────
+async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set a one-time reminder. Usage: /remind 15:30 Call mom"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    # Parse: /remind [HH:MM] [message]
+    parts = text.split(None, 2)
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "Usage: `/remind HH:MM Your reminder message`\n"
+            "Example: `/remind 15:30 Call mom back`\n\n"
+            "Times are in UTC. Use 24-hour format."
+        )
+        return
+    
+    time_str = parts[1]
+    reminder_text = parts[2] if len(parts) > 2 else "You asked me to remind you about something!"
+    
+    # Validate time format
+    try:
+        hour, minute = map(int, time_str.split(":"))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except (ValueError, AttributeError):
+        await update.message.reply_text("Invalid time format. Use HH:MM (e.g., 15:30)")
+        return
+    
+    # Calculate due time
+    now = datetime.now(timezone.utc)
+    due = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if due <= now:
+        due += timedelta(days=1)  # Tomorrow if time passed
+    
+    due_str = due.strftime("%Y-%m-%dT%H:%M:%S")
+    
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO scheduled_messages (user_id, message, due_at) VALUES (?, ?, ?)",
+        (user_id, reminder_text, due_str)
+    )
+    conn.commit()
+    conn.close()
+    
+    await update.message.reply_text(
+        f"✅ Got it! I'll remind you at **{time_str} UTC**:\n"
+        f"_{reminder_text}_"
+    )
+    logger.info(f"Reminder set for {user_id}: {time_str} UTC — {reminder_text}")
+
+
+async def daily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set or manage daily check-in. Usage: /daily HH:MM or /daily off"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    parts = text.split()
+    if len(parts) < 2:
+        # Show current daily setting
+        conn = get_db()
+        cur = conn.execute(
+            "SELECT due_at FROM scheduled_messages WHERE user_id = ? AND recurring = 1 LIMIT 1",
+            (user_id,)
+        )
+        row = cur.fetchone()
+        conn.close()
+        
+        if row:
+            await update.message.reply_text(
+                f"Your daily check-in is active! I'll message you every day.\n"
+                f"To turn it off: `/daily off`\n"
+                f"To change time: `/daily HH:MM`"
+            )
+        else:
+            await update.message.reply_text(
+                "No daily check-in set yet! Set one with:\n"
+                "`/daily 09:00` — I'll message you every day at 9am UTC\n"
+                "`/daily off` — turn it off"
+            )
+        return
+    
+    arg = parts[1].lower()
+    
+    if arg == "off":
+        conn = get_db()
+        conn.execute(
+            "DELETE FROM scheduled_messages WHERE user_id = ? AND recurring = 1",
+            (user_id,)
+        )
+        conn.commit()
+        conn.close()
+        await update.message.reply_text("🌙 Daily check-in turned off. I'll miss you!")
+        return
+    
+    # Set new daily time
+    try:
+        hour, minute = map(int, arg.split(":"))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except (ValueError, AttributeError):
+        await update.message.reply_text("Invalid time. Use HH:MM format (e.g., `/daily 09:00`)")
+        return
+    
+    conn = get_db()
+    _set_daily_checkin(conn, user_id, arg, _active_profile)
+    conn.close()
+    
+    await update.message.reply_text(
+        f"🌅 Daily check-in set! I'll message you every day around **{arg} UTC**.\n"
+        f"Each message will be personalized — transits, your recent thoughts, where you're at.\n"
+        f"Turn it off anytime with `/daily off`."
+    )
 
 
 # ── Birth Data Extraction ────────────────────────────────────────
@@ -1358,7 +1895,12 @@ def main():
     app.add_handler(CommandHandler("where", where_cmd))
     app.add_handler(CommandHandler("who", who_cmd))
     app.add_handler(CommandHandler("relate", relate_cmd))
+    app.add_handler(CommandHandler("remind", remind_cmd))
+    app.add_handler(CommandHandler("daily", daily_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Start background scheduler for reminders and daily check-ins
+    _start_scheduler(app)
     
     logger.info(f"{ASSISTANT_NAME} ({INSTANCE_PROFILE}) is running! Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
