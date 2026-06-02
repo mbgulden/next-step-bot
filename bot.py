@@ -40,6 +40,10 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is required")
 
+# Allowlist: comma-separated chat IDs. Empty = open to all (insecure).
+_ALLOWED_RAW = os.environ.get("ALLOWED_CHAT_IDS", "")
+ALLOWED_CHAT_IDS = set(int(x.strip()) for x in _ALLOWED_RAW.split(",") if x.strip()) if _ALLOWED_RAW else None
+
 # MCP Server path — where to find the Human Design calculation engine
 MCP_SRC = os.environ.get(
     "NEXTSTEP_MCP_SRC",
@@ -510,8 +514,15 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
     user_id = update.effective_user.id
+    
+    # Allowlist check
+    if ALLOWED_CHAT_IDS is not None and user_id not in ALLOWED_CHAT_IDS:
+        logger.warning(f"Blocked unauthorized user {user_id} ({update.effective_user.first_name})")
+        await update.message.reply_text("🔒 This is a personal assistant. Access restricted.")
+        return
+    
+    text = update.message.text.strip()
     name = update.effective_user.first_name
     
     try:

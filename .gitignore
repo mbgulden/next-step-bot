@@ -3,3 +3,4 @@ __pycache__/
 *.db
 .env
 family.json
+friends.json
