@@ -65,6 +65,12 @@ DB_PATH = Path(os.environ.get(
     str(Path(__file__).parent / "data" / "next_step.db")
 ))
 
+# Generated report artifacts (PDF + JSON metadata)
+REPORTS_DIR = Path(os.environ.get(
+    "NEXTSTEP_REPORTS_DIR",
+    str(Path(__file__).parent / "reports" / "generated")
+))
+
 # Identity
 ASSISTANT_NAME = os.environ.get("NEXTSTEP_NAME", "Jamie")
 INSTANCE_PROFILE = os.environ.get("NEXTSTEP_PROFILE", "next-step")
@@ -504,6 +510,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/daily off — Turn off daily messages\n\n"
         "**Human Design:**\n"
         "/chart — Your bodygraph\n"
+        "/report [profile|birth data] — Generate and send an HD report PDF\n"
         "/map — Astrocartography\n"
         "/where [career|love|family] — Best locations\n"
         "/who — Family profiles\n"
@@ -1706,6 +1713,252 @@ async def handle_relationship_query(update: Update, text: str, self_name: str):
         await update.message.reply_text(f"⚠️ Relationship analysis failed.\nError: {str(e)[:200]}")
 
 
+# ── HD Report PDF Generation ─────────────────────────────────────
+def _safe_slug(value: str) -> str:
+    """Filesystem-safe slug for generated artifact names."""
+    import re
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower()).strip("-")
+    return slug or "hd-report"
+
+
+def _birth_from_profile(profile: str) -> tuple[str, dict] | None:
+    """Return (profile_key, birth dict) for a saved family profile."""
+    _load_family()
+    key = profile.lower().strip() if profile else _active_profile
+    member = _family_data.get(key)
+    if not member:
+        return None
+    return key, {
+        "name": member.get("name", key.title()),
+        "year": member["year"], "month": member["month"], "day": member["day"],
+        "hour": member["hour"],
+        "location_str": member.get("location", "UTC"),
+        "lat": member.get("lat", 0), "lon": member.get("lon", 0),
+        "timezone": member.get("timezone", "UTC"),
+    }
+
+
+def _resolve_report_birth(args: list[str], user_name: str) -> tuple[str, dict, str]:
+    """
+    Capture report source inputs from /report arguments.
+
+    Returns (subject_name, birth_data, source). Args may be empty (active saved
+    profile), a saved profile key/name, or freeform birth data.
+    """
+    raw = " ".join(args).strip()
+    if raw:
+        profile = raw.lower().split()[0]
+        saved = _birth_from_profile(profile)
+        if saved and len(raw.split()) == 1:
+            _, birth = saved
+            return birth["name"], birth, f"saved-profile:{profile}"
+
+        birth = extract_birth_data(raw)
+        if birth:
+            birth["name"] = user_name
+            return user_name, birth, "command-args:birth-data"
+
+        # If the arg was not parseable birth data, try it as a profile key.
+        saved = _birth_from_profile(raw.lower())
+        if saved:
+            _, birth = saved
+            return birth["name"], birth, f"saved-profile:{raw.lower()}"
+
+        raise ValueError(
+            "I couldn't parse that as a saved profile or birth data. Try `/report michael` "
+            "or `/report 12/10/1989 @17:07 Simi Valley, CA`."
+        )
+
+    saved = _birth_from_profile(_active_profile)
+    if saved:
+        _, birth = saved
+        return birth["name"], birth, f"saved-profile:{_active_profile}"
+
+    birth = _get_active_birth()
+    birth["location_str"] = birth.get("location", "UTC")
+    return birth["name"], birth, "active-birth-fallback"
+
+
+def _calculate_report_chart(subject_name: str, birth: dict) -> tuple[dict, dict]:
+    """Resolve inputs and calculate the natal Human Design chart."""
+    _ensure_mcp_path()
+    from cosmic_calculator import calculate_natal_chart
+    from ephemeris_engine import init_ephemeris
+    from geo_resolver import resolve_location, local_to_utc
+
+    init_ephemeris()
+    loc = birth.get("location_str") or birth.get("location", "UTC")
+    geo = resolve_location(loc)
+    lat = birth.get("lat") if birth.get("lat") not in (None, 0) else geo.get("lat", 0.0)
+    lon = birth.get("lon") if birth.get("lon") not in (None, 0) else geo.get("lon", 0.0)
+    timezone_name = birth.get("timezone") or geo.get("timezone", "UTC")
+
+    utc_year, utc_month, utc_day, utc_hour = local_to_utc(
+        birth["year"], birth["month"], birth["day"], birth["hour"], loc
+    )
+    birth_dt = datetime(utc_year, utc_month, utc_day, int(utc_hour), int((utc_hour % 1) * 60))
+    chart = calculate_natal_chart(
+        name=subject_name,
+        birth_dt=birth_dt,
+        lat=lat,
+        lon=lon,
+        timezone=timezone_name,
+    )
+    resolved = dict(birth)
+    resolved.update({"location_str": loc, "lat": lat, "lon": lon, "timezone": timezone_name})
+    return chart, resolved
+
+
+def _chart_value(chart: dict, *keys: str, default=""):
+    for key in keys:
+        if key in chart and chart[key] not in (None, ""):
+            return chart[key]
+    return default
+
+
+def _build_report_lines(subject_name: str, birth: dict, chart: dict, source: str) -> list[str]:
+    """Build plain-text report content before PDF rendering."""
+    channels = chart.get("defined_channels", []) or []
+    gates = chart.get("defined_gates", []) or []
+    centers = chart.get("defined_centers", []) or []
+    cross = chart.get("incarnation_cross", "")
+    if isinstance(cross, dict):
+        cross = cross.get("name", "")
+
+    lines = [
+        f"Human Design Report: {subject_name}",
+        f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        f"Source input: {source}",
+        "",
+        "Captured source inputs",
+        f"Birth date: {birth.get('year')}-{birth.get('month'):02d}-{birth.get('day'):02d}",
+        f"Birth time: {birth.get('hour')} local",
+        f"Birth location: {birth.get('location_str') or birth.get('location', 'UTC')}",
+        f"Resolved coordinates: {birth.get('lat', 0):.4f}, {birth.get('lon', 0):.4f}",
+        f"Timezone: {birth.get('timezone', 'UTC')}",
+        "",
+        "Core chart",
+        f"Type: {_chart_value(chart, 'hd_type', 'type', default='Unknown')}",
+        f"Strategy: {_chart_value(chart, 'strategy', default='Unknown')}",
+        f"Authority: {_chart_value(chart, 'authority', default='Unknown')}",
+        f"Profile: {_chart_value(chart, 'profile', default='Unknown')}",
+        f"Incarnation Cross: {cross or 'Unknown'}",
+        "",
+        "Defined centers",
+        ", ".join(centers) if centers else "None listed",
+        "",
+        "Defined channels",
+    ]
+    if channels:
+        for channel in channels:
+            gates_pair = channel.get("gates", ["?", "?"])
+            lines.append(f"- {gates_pair[0]}-{gates_pair[1]} {channel.get('name', '')}".rstrip())
+    else:
+        lines.append("None listed")
+
+    lines.extend(["", "Defined gates"])
+    if gates:
+        gate_bits = []
+        for gate in gates:
+            if isinstance(gate, dict):
+                gate_bits.append(str(gate.get("gate") or gate.get("number") or gate))
+            else:
+                gate_bits.append(str(gate))
+        lines.append(", ".join(gate_bits))
+    else:
+        lines.append("None listed")
+
+    lines.extend([
+        "",
+        "Plain-English orientation",
+        "Use this as a starting map, not a diagnosis. The bot can use this PDF as a portable artifact, while the live chat can still pull fresh transits and relationship context when needed.",
+    ])
+    return lines
+
+
+def _write_text_pdf(lines: list[str], output_path: Path) -> None:
+    """Render a simple multi-page PDF using Pillow (available in the bot env)."""
+    from PIL import Image, ImageDraw, ImageFont
+    import textwrap
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    font = ImageFont.load_default()
+    title_font = ImageFont.load_default()
+    page_w, page_h = 1240, 1754  # A4-ish at 150dpi
+    margin = 90
+    line_h = 24
+    max_chars = 110
+    pages = []
+    img = Image.new("RGB", (page_w, page_h), "white")
+    draw = ImageDraw.Draw(img)
+    y = margin
+
+    def new_page():
+        nonlocal img, draw, y
+        pages.append(img)
+        img = Image.new("RGB", (page_w, page_h), "white")
+        draw = ImageDraw.Draw(img)
+        y = margin
+
+    for idx, line in enumerate(lines):
+        chunks = textwrap.wrap(line, width=max_chars) or [""]
+        for chunk in chunks:
+            if y > page_h - margin:
+                new_page()
+            draw.text((margin, y), chunk, fill="black", font=title_font if idx == 0 else font)
+            y += line_h
+        if line == "":
+            y += line_h // 2
+
+    pages.append(img)
+    first, rest = pages[0], pages[1:]
+    first.save(output_path, "PDF", resolution=150.0, save_all=True, append_images=rest)
+
+
+def generate_hd_report_pdf(subject_name: str, birth: dict, source: str, user_id: int) -> tuple[Path, Path]:
+    """Generate PDF + JSON metadata artifacts and return their paths."""
+    chart, resolved_birth = _calculate_report_chart(subject_name, birth)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stem = f"{_safe_slug(subject_name)}-{user_id}-{timestamp}"
+    pdf_path = REPORTS_DIR / f"{stem}.pdf"
+    meta_path = REPORTS_DIR / f"{stem}.json"
+    lines = _build_report_lines(subject_name, resolved_birth, chart, source)
+    _write_text_pdf(lines, pdf_path)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(meta_path, "w") as f:
+        json.dump({
+            "subject": subject_name,
+            "source": source,
+            "birth": resolved_birth,
+            "chart": chart,
+            "pdf_path": str(pdf_path),
+            "generated_at": timestamp,
+        }, f, indent=2, default=str)
+    return pdf_path, meta_path
+
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate and send a Human Design report PDF."""
+    user = update.effective_user
+    await update.message.reply_text("📄 Generating your Human Design report PDF...")
+    try:
+        subject_name, birth, source = _resolve_report_birth(context.args, user.first_name)
+        pdf_path, meta_path = generate_hd_report_pdf(subject_name, birth, source, user.id)
+        with open(pdf_path, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename=pdf_path.name,
+                caption=f"✅ HD report for {subject_name}\nArtifact: `{pdf_path}`",
+            )
+        logger.info(f"Generated HD report PDF {pdf_path} with metadata {meta_path}")
+    except ImportError as e:
+        logger.exception(f"Report import error: {e}")
+        await update.message.reply_text(f"⚠️ Couldn't load the report engine.\nError: {str(e)[:150]}")
+    except Exception as e:
+        logger.exception(f"Report generation error: {e}")
+        await update.message.reply_text(f"⚠️ Report generation failed.\nError: {str(e)[:200]}")
+
+
 # ── Image Commands ────────────────────────────────────────────────
 async def chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate and send a bodygraph chart image."""
@@ -1902,6 +2155,7 @@ def main():
     app.add_handler(CommandHandler("list", lambda u, c: handle_message(u, c)))
     app.add_handler(CommandHandler("status", lambda u, c: handle_message(u, c)))
     app.add_handler(CommandHandler("chart", chart_cmd))
+    app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("map", map_cmd))
     app.add_handler(CommandHandler("where", where_cmd))
     app.add_handler(CommandHandler("who", who_cmd))

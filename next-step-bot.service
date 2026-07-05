@@ -7,6 +7,8 @@ Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/work/next-step-bot
 EnvironmentFile=/home/ubuntu/work/next-step-bot/.env
+Environment=PYTHONPATH=/home/ubuntu/work/OpenHumanDesignMCP/hd-mcp-server/src
+Environment=NEXTSTEP_MCP_SRC=/home/ubuntu/work/OpenHumanDesignMCP/hd-mcp-server/src
 ExecStart=/home/ubuntu/.local/share/pipx/venvs/hermes-agent/bin/python /home/ubuntu/work/next-step-bot/bot.py
 Restart=always
 RestartSec=10
