@@ -507,7 +507,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/map — Astrocartography\n"
         "/where [career|love|family] — Best locations\n"
         "/who — Family profiles\n"
-        "/relate [name] — Compatibility\n\n"
+        "/relate [name] — Compatibility\n"
+        "/relationship [name] — Concise relationship reading\n\n"
         "**Or just talk to me naturally.** Dump tasks, ask questions, "
         "explore your chart — I flow between everything smoothly."
     )
@@ -1864,15 +1865,15 @@ async def who_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Unknown profile. Available: {available}")
 
 
-async def relate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show relationship composite between active profile and target."""
+async def _relationship_command(update: Update, context: ContextTypes.DEFAULT_TYPE, command_name: str):
+    """Show a concise HD relationship reading between the active profile and a target."""
     args = context.args
     _load_family()
     active_name = _family_data.get(_active_profile, {}).get("name", _active_profile)
 
     if not args:
         available = ", ".join(f"`{k}`" for k in _family_data.keys() if k != _active_profile)
-        await update.message.reply_text(f"Usage: `/relate NAME`\nAvailable: {available}")
+        await update.message.reply_text(f"Usage: `/{command_name} NAME`\nAvailable: {available}")
         return
 
     target = args[0].lower()
@@ -1880,12 +1881,22 @@ async def relate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Unknown profile '{target}'. Use /who to see family.")
         return
     if target == _active_profile:
-        await update.message.reply_text("That's you! Try `/relate becca` or another family member.")
+        await update.message.reply_text(f"That's you! Try `/{command_name} becca` or another family member.")
         return
 
-    # Reuse relationship query handler
-    fake_update = update
-    await handle_relationship_query(fake_update, f"me and {target}", active_name)
+    # Reuse the natural-language relationship handler so /relate and
+    # /relationship stay backed by the same HD composite data source.
+    await handle_relationship_query(update, f"me and {target}", active_name)
+
+
+async def relate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show relationship composite between active profile and target."""
+    await _relationship_command(update, context, "relate")
+
+
+async def relationship_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias for /relate with a clearer command name for relationship readings."""
+    await _relationship_command(update, context, "relationship")
 
 
 # ── Main ─────────────────────────────────────────────────────────
@@ -1906,6 +1917,7 @@ def main():
     app.add_handler(CommandHandler("where", where_cmd))
     app.add_handler(CommandHandler("who", who_cmd))
     app.add_handler(CommandHandler("relate", relate_cmd))
+    app.add_handler(CommandHandler("relationship", relationship_cmd))
     app.add_handler(CommandHandler("remind", remind_cmd))
     app.add_handler(CommandHandler("daily", daily_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
